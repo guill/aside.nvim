@@ -1,0 +1,809 @@
+local MiniTest = require("mini.test")
+local eq = MiniTest.expect.equality
+
+local child = MiniTest.new_child_neovim()
+
+local T = MiniTest.new_set({
+  hooks = {
+    pre_case = function()
+      child.restart({ "-u", "test/init_minimal.lua" })
+      child.lua("require('aside').setup({ persistence = { enabled = false } })")
+    end,
+    post_once = child.stop,
+  },
+})
+
+T["setup()"] = MiniTest.new_set()
+
+T["setup()"]["creates default config"] = function()
+  local display = child.lua_get("require('aside.config').get().default_display")
+  eq(display, "hover")
+
+  local context_lines = child.lua_get("require('aside.config').get().context_lines")
+  eq(context_lines, 3)
+end
+
+T["setup()"]["accepts custom config"] = function()
+  child.lua("require('aside').setup({ default_display = 'below', context_lines = 5 })")
+
+  local display = child.lua_get("require('aside.config').get().default_display")
+  eq(display, "below")
+
+  local context_lines = child.lua_get("require('aside.config').get().context_lines")
+  eq(context_lines, 5)
+end
+
+T["families"] = MiniTest.new_set()
+
+T["families"]["ensure_family creates new family"] = function()
+  child.lua("require('aside').ensure_family('test_family')")
+  local exists = child.lua_get("require('aside.state').family_exists('test_family')")
+  eq(exists, true)
+end
+
+T["families"]["list_families returns all families"] = function()
+  child.lua("require('aside').ensure_family('family_a')")
+  child.lua("require('aside').ensure_family('family_b')")
+
+  local families = child.lua_get("require('aside').list_families()")
+  eq(vim.tbl_contains(families, "family_a"), true)
+  eq(vim.tbl_contains(families, "family_b"), true)
+end
+
+T["families"]["family configuration"] = function()
+  child.lua("require('aside').ensure_family('custom_family'):configure({ display = 'aside' })")
+
+  local display = child.lua_get("require('aside.state').get_family('custom_family'):get_config().display")
+  eq(display, "aside")
+end
+
+T["annotations"] = MiniTest.new_set()
+
+T["annotations"]["add_annotation returns id"] = function()
+  child.lua([[
+    _G.test_id = require("aside").add_annotation({
+      family = "test_family",
+      file = "/tmp/test.lua",
+      start_line = 10,
+      end_line = 15,
+      title = "Test Title",
+      contents = "Test Contents",
+    })
+  ]])
+
+  local id = child.lua_get("_G.test_id")
+  eq(type(id), "string")
+  eq(#id > 0, true)
+end
+
+T["annotations"]["get_annotation retrieves by id"] = function()
+  child.lua([[
+    _G.test_id = require("aside").add_annotation({
+      family = "test_family",
+      file = "/tmp/test.lua",
+      start_line = 10,
+      end_line = 15,
+      title = "Test Title",
+    })
+  ]])
+
+  local title = child.lua_get("require('aside').get_annotation(_G.test_id).title")
+  eq(title, "Test Title")
+
+  local start_line = child.lua_get("require('aside').get_annotation(_G.test_id).start_line")
+  eq(start_line, 10)
+end
+
+T["annotations"]["get_by_file returns file annotations"] = function()
+  child.lua([[
+    require("aside").add_annotation({
+      family = "test_family",
+      file = "/tmp/file_a.lua",
+      start_line = 1,
+      end_line = 1,
+      title = "Ann A",
+    })
+  ]])
+
+  local count = child.lua_get("#require('aside').get_annotations_by_file('/tmp/file_a.lua')")
+  eq(count, 1)
+end
+
+T["annotations"]["get_by_family returns family annotations"] = function()
+  child.lua([[
+    require("aside").add_annotation({
+      family = "family_x",
+      file = "/tmp/test.lua",
+      start_line = 1,
+      end_line = 1,
+      title = "X1",
+    })
+  ]])
+
+  local count = child.lua_get("#require('aside').get_annotations_by_family('family_x')")
+  eq(count, 1)
+end
+
+T["annotations"]["update_annotation modifies annotation"] = function()
+  child.lua([[
+    _G.test_id = require("aside").add_annotation({
+      family = "test_family",
+      file = "/tmp/test.lua",
+      start_line = 1,
+      end_line = 1,
+      title = "Original",
+    })
+  ]])
+
+  child.lua("require('aside').update_annotation(_G.test_id, { title = 'Updated' })")
+
+  local title = child.lua_get("require('aside').get_annotation(_G.test_id).title")
+  eq(title, "Updated")
+end
+
+T["annotations"]["delete_annotation removes annotation"] = function()
+  child.lua([[
+    _G.test_id = require("aside").add_annotation({
+      family = "test_family",
+      file = "/tmp/test.lua",
+      start_line = 1,
+      end_line = 1,
+      title = "To Delete",
+    })
+  ]])
+
+  child.lua("require('aside').delete_annotation(_G.test_id)")
+
+  local ann = child.lua_get("require('aside').get_annotation(_G.test_id)")
+  eq(ann, vim.NIL)
+end
+
+T["state"] = MiniTest.new_set()
+
+T["state"]["events are emitted"] = function()
+  child.lua([[
+    _G.events = {}
+    require("aside.state").on("annotation_added", function(data)
+      table.insert(_G.events, "added")
+    end)
+    require("aside.state").on("annotation_deleted", function(data)
+      table.insert(_G.events, "deleted")
+    end)
+  ]])
+
+  child.lua([[
+    _G.test_id = require("aside").add_annotation({
+      family = "test",
+      file = "/tmp/test.lua",
+      start_line = 1,
+      end_line = 1,
+    })
+  ]])
+  child.lua("require('aside').delete_annotation(_G.test_id)")
+
+  local events = child.lua_get("_G.events")
+  eq(#events, 2)
+  eq(events[1], "added")
+  eq(events[2], "deleted")
+end
+
+T["state"]["event unsubscribe works"] = function()
+  child.lua([[
+    _G.count = 0
+    _G.unsub = require("aside.state").on("annotation_added", function()
+      _G.count = _G.count + 1
+    end)
+  ]])
+
+  child.lua([[
+    require("aside").add_annotation({
+      family = "test",
+      file = "/tmp/test.lua",
+      start_line = 1,
+      end_line = 1,
+    })
+  ]])
+  eq(child.lua_get("_G.count"), 1)
+
+  child.lua("_G.unsub()")
+
+  child.lua([[
+    require("aside").add_annotation({
+      family = "test",
+      file = "/tmp/test2.lua",
+      start_line = 1,
+      end_line = 1,
+    })
+  ]])
+  eq(child.lua_get("_G.count"), 1)
+end
+
+T["state"]["delete_family removes all annotations"] = function()
+  child.lua([[
+    require("aside").add_annotation({
+      family = "to_delete",
+      file = "/tmp/test.lua",
+      start_line = 1,
+      end_line = 1,
+    })
+    require("aside").add_annotation({
+      family = "to_delete",
+      file = "/tmp/test2.lua",
+      start_line = 5,
+      end_line = 10,
+    })
+  ]])
+
+  local count_before = child.lua_get("#require('aside').get_annotations_by_family('to_delete')")
+  eq(count_before, 2)
+
+  child.lua("require('aside').delete_family('to_delete')")
+
+  local count_after = child.lua_get("#require('aside').get_annotations_by_family('to_delete')")
+  eq(count_after, 0)
+
+  local exists = child.lua_get("require('aside').family_exists('to_delete')")
+  eq(exists, false)
+end
+
+T["annotations"]["missing family returns nil"] = function()
+  child.lua([[
+    _G.result = require("aside").add_annotation({
+      file = "/tmp/test.lua",
+      start_line = 1,
+      end_line = 1,
+    })
+  ]])
+
+  local result = child.lua_get("_G.result")
+  eq(result, vim.NIL)
+end
+
+T["annotations"]["missing file returns nil"] = function()
+  child.lua([[
+    _G.result = require("aside").add_annotation({
+      family = "test",
+      start_line = 1,
+      end_line = 1,
+    })
+  ]])
+
+  local result = child.lua_get("_G.result")
+  eq(result, vim.NIL)
+end
+
+T["annotations"]["invalid start_line returns nil"] = function()
+  child.lua([[
+    _G.result = require("aside").add_annotation({
+      family = "test",
+      file = "/tmp/test.lua",
+      start_line = -5,
+      end_line = 1,
+    })
+  ]])
+
+  local result = child.lua_get("_G.result")
+  eq(result, vim.NIL)
+end
+
+T["annotations"]["end_line < start_line auto-swaps"] = function()
+  child.lua([[
+    _G.test_id = require("aside").add_annotation({
+      family = "test",
+      file = "/tmp/test.lua",
+      start_line = 10,
+      end_line = 5,
+    })
+  ]])
+
+  local start_line = child.lua_get("require('aside').get_annotation(_G.test_id).start_line")
+  local end_line = child.lua_get("require('aside').get_annotation(_G.test_id).end_line")
+  eq(start_line, 5)
+  eq(end_line, 10)
+end
+
+T["annotations"]["update nonexistent returns false"] = function()
+  local result = child.lua_get("require('aside').update_annotation('nonexistent-id', { title = 'New' })")
+  eq(result, false)
+end
+
+T["annotations"]["update ignores disallowed fields"] = function()
+  child.lua([[
+    _G.test_id = require("aside").add_annotation({
+      family = "test",
+      file = "/tmp/original.lua",
+      start_line = 1,
+      end_line = 5,
+      title = "Original",
+    })
+  ]])
+
+  child.lua([[
+    require("aside").update_annotation(_G.test_id, {
+      file = "/tmp/hacked.lua",
+      start_line = 100,
+      end_line = 200,
+      title = "Updated",
+    })
+  ]])
+
+  local file = child.lua_get("require('aside').get_annotation(_G.test_id).file")
+  local start_line = child.lua_get("require('aside').get_annotation(_G.test_id).start_line")
+  local title = child.lua_get("require('aside').get_annotation(_G.test_id).title")
+
+  eq(file, "/tmp/original.lua")
+  eq(start_line, 1)
+  eq(title, "Updated")
+end
+
+T["annotations"]["delete nonexistent returns false"] = function()
+  local result = child.lua_get("require('aside').delete_annotation('nonexistent-id')")
+  eq(result, false)
+end
+
+T["annotations"]["get_by_metadata filters correctly"] = function()
+  child.lua([[
+    require("aside").add_annotation({
+      family = "test",
+      file = "/tmp/test.lua",
+      start_line = 1,
+      end_line = 1,
+      metadata = { pr_id = 123, author = "alice" },
+    })
+    require("aside").add_annotation({
+      family = "test",
+      file = "/tmp/test.lua",
+      start_line = 5,
+      end_line = 5,
+      metadata = { pr_id = 456, author = "bob" },
+    })
+    require("aside").add_annotation({
+      family = "test",
+      file = "/tmp/test.lua",
+      start_line = 10,
+      end_line = 10,
+      metadata = { pr_id = 123, author = "charlie" },
+    })
+  ]])
+
+  local count = child.lua_get([[
+    #require("aside").get_annotations_by_metadata(function(m)
+      return m and m.pr_id == 123
+    end)
+  ]])
+  eq(count, 2)
+end
+
+T["annotations"]["sorting by sort_key first"] = function()
+  child.lua([[
+    require("aside").add_annotation({
+      family = "test",
+      file = "/tmp/test.lua",
+      start_line = 1,
+      end_line = 1,
+      title = "C",
+      sort_key = 3,
+    })
+    require("aside").add_annotation({
+      family = "test",
+      file = "/tmp/test.lua",
+      start_line = 1,
+      end_line = 1,
+      title = "A",
+      sort_key = 1,
+    })
+    require("aside").add_annotation({
+      family = "test",
+      file = "/tmp/test.lua",
+      start_line = 1,
+      end_line = 1,
+      title = "B",
+      sort_key = 2,
+    })
+  ]])
+
+  local titles = child.lua_get([[
+    vim.tbl_map(function(a) return a.title end, require("aside").get_annotations_by_file("/tmp/test.lua"))
+  ]])
+  eq(titles, { "A", "B", "C" })
+end
+
+T["annotations"]["sorting by end_line when no sort_key"] = function()
+  child.lua([[
+    require("aside").add_annotation({
+      family = "test",
+      file = "/tmp/test.lua",
+      start_line = 1,
+      end_line = 20,
+      title = "Third",
+    })
+    require("aside").add_annotation({
+      family = "test",
+      file = "/tmp/test.lua",
+      start_line = 1,
+      end_line = 5,
+      title = "First",
+    })
+    require("aside").add_annotation({
+      family = "test",
+      file = "/tmp/test.lua",
+      start_line = 1,
+      end_line = 10,
+      title = "Second",
+    })
+  ]])
+
+  local titles = child.lua_get([[
+    vim.tbl_map(function(a) return a.title end, require("aside").get_annotations_by_file("/tmp/test.lua"))
+  ]])
+  eq(titles, { "First", "Second", "Third" })
+end
+
+T["context"] = MiniTest.new_set()
+
+T["context"]["read_file_lines returns nil for nonexistent file"] = function()
+  local result = child.lua_get("require('aside.context').read_file_lines('/nonexistent/path/file.lua')")
+  eq(result, vim.NIL)
+end
+
+T["context"]["capture returns nil for nonexistent file"] = function()
+  local result = child.lua_get("require('aside.context').capture('/nonexistent/path/file.lua', 1, 5, 3)")
+  eq(result, vim.NIL)
+end
+
+T["context"]["capture clamps lines to file bounds"] = function()
+  child.lua([[
+    local file = io.open("/tmp/test_context.lua", "w")
+    file:write("line1\nline2\nline3\nline4\nline5\n")
+    file:close()
+  ]])
+
+  child.lua([[
+    _G.ctx = require("aside.context").capture("/tmp/test_context.lua", 10, 15, 2)
+  ]])
+
+  local marked = child.lua_get("_G.ctx.marked_content")
+  eq(#marked, 1)
+  eq(marked[1], "line5")
+end
+
+T["context"]["capture handles empty context_lines"] = function()
+  child.lua([[
+    local file = io.open("/tmp/test_ctx2.lua", "w")
+    file:write("line1\nline2\nline3\nline4\nline5\n")
+    file:close()
+  ]])
+
+  child.lua([[
+    _G.ctx = require("aside.context").capture("/tmp/test_ctx2.lua", 3, 3, 0)
+  ]])
+
+  local before = child.lua_get("_G.ctx.context_before")
+  local after = child.lua_get("_G.ctx.context_after")
+  local marked = child.lua_get("_G.ctx.marked_content")
+
+  eq(#before, 0)
+  eq(#after, 0)
+  eq(marked, { "line3" })
+end
+
+T["context"]["has_context returns false for nil annotation"] = function()
+  local result = child.lua_get("require('aside.context').has_context(nil)")
+  eq(result, false)
+end
+
+T["context"]["has_context returns false for empty marked_content"] = function()
+  local result = child.lua_get("require('aside.context').has_context({ marked_content = {} })")
+  eq(result, false)
+end
+
+T["context"]["has_context returns true for valid content"] = function()
+  local result = child.lua_get("require('aside.context').has_context({ marked_content = { 'line1' } })")
+  eq(result, true)
+end
+
+T["relocator"] = MiniTest.new_set()
+
+T["relocator"]["returns unchanged for nonexistent file"] = function()
+  child.lua([[
+    _G.results = require("aside.relocator").relocate_annotations_for_file(
+      "/nonexistent/file.lua",
+      {{ id = "test", start_line = 1, end_line = 5 }}
+    )
+  ]])
+
+  local status = child.lua_get("_G.results[1].status")
+  eq(status, "unchanged")
+end
+
+T["relocator"]["returns unchanged for annotation without context"] = function()
+  child.lua([[
+    local file = io.open("/tmp/test_reloc.lua", "w")
+    file:write("line1\nline2\nline3\n")
+    file:close()
+  ]])
+
+  child.lua([[
+    _G.results = require("aside.relocator").relocate_annotations_for_file(
+      "/tmp/test_reloc.lua",
+      {{ id = "test", start_line = 1, end_line = 1, marked_content = nil }}
+    )
+  ]])
+
+  local status = child.lua_get("_G.results[1].status")
+  eq(status, "unchanged")
+end
+
+T["relocator"]["exact match when full sequence found"] = function()
+  child.lua([[
+    local file = io.open("/tmp/test_exact.lua", "w")
+    file:write("before1\nbefore2\nTARGET\nafter1\nafter2\n")
+    file:close()
+  ]])
+
+  child.lua([[
+    _G.results = require("aside.relocator").relocate_annotations_for_file(
+      "/tmp/test_exact.lua",
+      {{
+        id = "test",
+        start_line = 100,  -- Wrong position
+        end_line = 100,
+        marked_content = { "TARGET" },
+        context_before = { "before1", "before2" },
+        context_after = { "after1", "after2" },
+      }}
+    )
+  ]])
+
+  local status = child.lua_get("_G.results[1].status")
+  local new_start = child.lua_get("_G.results[1].new_start")
+
+  eq(status, "exact")
+  eq(new_start, 3)
+end
+
+T["relocator"]["content_only match when context changed"] = function()
+  child.lua([[
+    local file = io.open("/tmp/test_content.lua", "w")
+    file:write("changed_before\nUNIQUE_TARGET_LINE\nchanged_after\n")
+    file:close()
+  ]])
+
+  child.lua([[
+    _G.results = require("aside.relocator").relocate_annotations_for_file(
+      "/tmp/test_content.lua",
+      {{
+        id = "test",
+        start_line = 100,
+        end_line = 100,
+        marked_content = { "UNIQUE_TARGET_LINE" },
+        context_before = { "old_before" },
+        context_after = { "old_after" },
+      }}
+    )
+  ]])
+
+  local status = child.lua_get("_G.results[1].status")
+  local new_start = child.lua_get("_G.results[1].new_start")
+
+  eq(status, "content_only")
+  eq(new_start, 2)
+end
+
+T["relocator"]["unchanged when multiple matches exist"] = function()
+  child.lua([[
+    local file = io.open("/tmp/test_multi.lua", "w")
+    file:write("DUPLICATE\nother\nDUPLICATE\n")
+    file:close()
+  ]])
+
+  child.lua([[
+    _G.results = require("aside.relocator").relocate_annotations_for_file(
+      "/tmp/test_multi.lua",
+      {{
+        id = "test",
+        start_line = 1,
+        end_line = 1,
+        marked_content = { "DUPLICATE" },
+        context_before = {},
+        context_after = {},
+      }}
+    )
+  ]])
+
+  local status = child.lua_get("_G.results[1].status")
+  eq(status, "unchanged")
+end
+
+T["relocator"]["relocates multiple annotations in batch"] = function()
+  child.lua([[
+    local file = io.open("/tmp/test_batch.lua", "w")
+    file:write("header\nFIRST_UNIQUE\nmiddle\nSECOND_UNIQUE\nfooter\n")
+    file:close()
+  ]])
+
+  child.lua([[
+    _G.results = require("aside.relocator").relocate_all_annotations({
+      {
+        id = "ann1",
+        file = "/tmp/test_batch.lua",
+        start_line = 100,
+        end_line = 100,
+        marked_content = { "FIRST_UNIQUE" },
+        context_before = { "header" },
+        context_after = { "middle" },
+      },
+      {
+        id = "ann2",
+        file = "/tmp/test_batch.lua",
+        start_line = 200,
+        end_line = 200,
+        marked_content = { "SECOND_UNIQUE" },
+        context_before = { "middle" },
+        context_after = { "footer" },
+      },
+    })
+  ]])
+
+  local count = child.lua_get("#_G.results")
+  eq(count, 2)
+
+  local r1 = child.lua_get("vim.tbl_filter(function(r) return r.annotation_id == 'ann1' end, _G.results)[1]")
+  local r2 = child.lua_get("vim.tbl_filter(function(r) return r.annotation_id == 'ann2' end, _G.results)[1]")
+
+  eq(r1.new_start, 2)
+  eq(r2.new_start, 4)
+end
+
+T["tracking"] = MiniTest.new_set()
+
+T["tracking"]["attach_extmark returns nil for unloaded buffer"] = function()
+  local result = child.lua_get([[
+    require("aside.tracking").attach_extmark({
+      id = "test",
+      file = "/nonexistent/buffer.lua",
+      start_line = 1,
+      end_line = 1,
+    })
+  ]])
+  eq(result, vim.NIL)
+end
+
+T["tracking"]["extmarks track line movements"] = function()
+  child.lua([[
+    vim.cmd("enew")
+    local buf = vim.api.nvim_get_current_buf()
+    vim.api.nvim_buf_set_name(buf, "/tmp/track_test.lua")
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {
+      "line1",
+      "line2",
+      "line3",
+      "line4",
+      "line5",
+    })
+    _G.test_buf = buf
+  ]])
+
+  child.lua([[
+    _G.test_id = require("aside").add_annotation({
+      family = "track_test",
+      file = "/tmp/track_test.lua",
+      start_line = 3,
+      end_line = 3,
+      title = "Track me",
+    })
+  ]])
+
+  child.lua([[
+    vim.api.nvim_buf_set_lines(_G.test_buf, 0, 0, false, { "new1", "new2" })
+  ]])
+
+  child.lua("require('aside.tracking').sync_extmarks(_G.test_buf)")
+
+  local new_start = child.lua_get("require('aside').get_annotation(_G.test_id).start_line")
+  eq(new_start, 5)
+end
+
+T["persistence"] = MiniTest.new_set()
+
+T["persistence"]["save and load roundtrip preserves all fields"] = function()
+  child.lua([[
+    require("aside").setup({
+      persistence = { enabled = true },
+      data_dir = "/tmp/aside_test_persist",
+    })
+  ]])
+
+  child.lua([[
+    require("aside").add_annotation({
+      family = "persist_test",
+      file = "/tmp/test.lua",
+      start_line = 10,
+      end_line = 20,
+      title = "Test Title",
+      contents = "Test Contents",
+      sort_key = 42,
+      metadata = { key = "value", nested = { a = 1 } },
+    })
+  ]])
+
+  child.lua("require('aside.persistence').save_family('persist_test')")
+
+  child.lua("require('aside.state').clear()")
+
+  local cleared_count = child.lua_get("#require('aside').get_annotations_by_family('persist_test')")
+  eq(cleared_count, 0)
+
+  child.lua("require('aside.persistence').load_family('persist_test')")
+
+  child.lua("_G.loaded = require('aside').get_annotations_by_family('persist_test')[1]")
+
+  eq(child.lua_get("_G.loaded.file"), "/tmp/test.lua")
+  eq(child.lua_get("_G.loaded.start_line"), 10)
+  eq(child.lua_get("_G.loaded.end_line"), 20)
+  eq(child.lua_get("_G.loaded.title"), "Test Title")
+  eq(child.lua_get("_G.loaded.contents"), "Test Contents")
+  eq(child.lua_get("_G.loaded.sort_key"), 42)
+  eq(child.lua_get("_G.loaded.metadata.key"), "value")
+  eq(child.lua_get("_G.loaded.metadata.nested.a"), 1)
+end
+
+T["persistence"]["load returns false for nonexistent file"] = function()
+  local result = child.lua_get("require('aside.persistence').load_family('nonexistent_family_xyz')")
+  eq(result, false)
+end
+
+T["persistence"]["load handles corrupted JSON gracefully"] = function()
+  child.lua([[
+    vim.fn.mkdir("/tmp/aside_corrupt_test", "p")
+    local file = io.open("/tmp/aside_corrupt_test/broken.json", "w")
+    file:write("{ this is not valid json }")
+    file:close()
+  ]])
+
+  child.lua([[
+    require("aside").setup({
+      data_dir = "/tmp/aside_corrupt_test",
+    })
+  ]])
+
+  local result = child.lua_get("require('aside.persistence').load_family('broken')")
+  eq(result, false)
+end
+
+T["families"]["config inherits from global defaults"] = function()
+  child.lua([[
+    require("aside").setup({
+      default_display = "below",
+      context_lines = 7,
+    })
+    require("aside").ensure_family("inherit_test")
+  ]])
+
+  local display = child.lua_get("require('aside.state').get_family('inherit_test'):get_config().display")
+  local context = child.lua_get("require('aside.state').get_family('inherit_test'):get_config().context_lines")
+
+  eq(display, "below")
+  eq(context, 7)
+end
+
+T["families"]["family config overrides global defaults"] = function()
+  child.lua([[
+    require("aside").setup({
+      default_display = "hover",
+      context_lines = 3,
+    })
+    require("aside").ensure_family("override_test"):configure({
+      display = "aside",
+      context_lines = 10,
+    })
+  ]])
+
+  local display = child.lua_get("require('aside.state').get_family('override_test'):get_config().display")
+  local context = child.lua_get("require('aside.state').get_family('override_test'):get_config().context_lines")
+
+  eq(display, "aside")
+  eq(context, 10)
+end
+
+return T
