@@ -1,3 +1,5 @@
+---@diagnostic disable: undefined-global,trailing-space
+local nvim = _G.vim
 local M = {}
 
 local config = require("aside.config")
@@ -30,16 +32,44 @@ local FamilyMethods = {}
 FamilyMethods.__index = FamilyMethods
 
 function FamilyMethods:configure(opts)
-  self.config = vim.tbl_deep_extend("force", self.config, opts or {})
+  opts = opts or {}
+
+  if opts.spill_direction ~= nil and opts.spill_direction ~= "above" and opts.spill_direction ~= "below" then
+    nvim.notify("aside: spill_direction must be 'above' or 'below'", nvim.log.levels.ERROR)
+    return
+  end
+
+  if opts.aside_width ~= nil and (type(opts.aside_width) ~= "number" or math.floor(opts.aside_width) ~= opts.aside_width or opts.aside_width <= 0) then
+    nvim.notify("aside: aside_width must be a positive integer", nvim.log.levels.ERROR)
+    return
+  end
+
+  if opts.layout_solver ~= nil and type(opts.layout_solver) ~= "string" then
+    nvim.notify("aside: layout_solver must be a string", nvim.log.levels.ERROR)
+    return
+  end
+
+  if opts.gutter_icon ~= nil then
+    local width = nvim.fn.strdisplaywidth(opts.gutter_icon)
+    if width ~= 1 then
+      nvim.notify(string.format("aside: gutter_icon must be display-width 1; got width %d for '%s'", width, opts.gutter_icon), nvim.log.levels.ERROR)
+      return
+    end
+  end
+
+  self.config = nvim.tbl_deep_extend("force", self.config, opts or {})
   require("aside.display").refresh_family(self.name)
 end
 
 function FamilyMethods:get_config()
   local global_config = config.get()
-  return vim.tbl_deep_extend("force", {
+  return nvim.tbl_deep_extend("force", {
     display = global_config.default_display,
     gutter_icon = global_config.default_gutter_icon,
     context_lines = global_config.context_lines,
+    aside_width = global_config.aside_width,
+    spill_direction = global_config.spill_direction,
+    layout_solver = global_config.layout_solver,
     highlight_groups = global_config.highlight_groups,
   }, self.config)
 end
@@ -99,14 +129,14 @@ function M.add_annotation(annotation)
   annotation.id = annotation.id or generate_uuid()
   annotation.created_at = annotation.created_at or os.time()
   annotation.verified = annotation.verified ~= false
-  
+
   annotations_by_id[annotation.id] = annotation
-  
+
   local family = M.ensure_family(annotation.family)
   family.annotations[annotation.id] = true
-  
+
   M.emit("annotation_added", { annotation = annotation })
-  
+
   return annotation
 end
 
@@ -127,13 +157,13 @@ function M.update_annotation(id, updates)
   if not annotation then
     return nil
   end
-  
-  local old_annotation = vim.deepcopy(annotation)
-  
+
+  local old_annotation = nvim.deepcopy(annotation)
+
   for key, value in pairs(updates) do
     annotation[key] = value
   end
-  
+
   M.emit("annotation_updated", {
     annotation = annotation,
     old_annotation = old_annotation,
@@ -147,16 +177,16 @@ function M.delete_annotation(id)
   if not annotation then
     return nil
   end
-  
+
   annotations_by_id[id] = nil
-  
+
   local family = families[annotation.family]
   if family then
     family.annotations[id] = nil
   end
-  
+
   M.emit("annotation_deleted", { annotation = annotation })
-  
+
   return annotation
 end
 
@@ -165,12 +195,12 @@ function M.relocate_annotation(id, new_start, new_end, is_external)
   if not annotation then
     return nil
   end
-  
+
   local old_position = {
     start_line = annotation.start_line,
     end_line = annotation.end_line,
   }
-  
+
   annotation.start_line = new_start
   annotation.end_line = new_end
   
@@ -204,7 +234,7 @@ function M.emit(event, data)
   for _, callback in ipairs(event_listeners[event] or {}) do
     local ok, err = pcall(callback, data)
     if not ok then
-      vim.notify("aside.nvim event error: " .. tostring(err), vim.log.levels.ERROR)
+      nvim.notify("aside.nvim event error: " .. tostring(err), nvim.log.levels.ERROR)
     end
   end
 end

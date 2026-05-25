@@ -1,3 +1,4 @@
+---@diagnostic disable: undefined-global,trailing-space
 ---@mod aside.nvim Annotation tracking and display library for Neovim
 ---@brief [[
 --- aside.nvim provides APIs for tracking and displaying annotations in code files.
@@ -5,7 +6,7 @@
 ---@brief ]]
 
 local M = {}
-
+local nvim = vim
 local config = require("aside.config")
 local state = require("aside.state")
 local annotations = require("aside.annotations")
@@ -17,13 +18,27 @@ local display = require("aside.display")
 ---@field persistence_debounce_ms? number Debounce time for persistence writes (default: 1000)
 ---@field default_display? "hidden"|"hover"|"below"|"aside" Default display mode for new families (default: "hover")
 ---@field default_gutter_icon? string Default gutter icon for hover mode (default: "●")
+---@field aside_width? number Width of the aside panel (default: 40)
+---@field spill_direction? "above"|"below" Direction to spill overflow annotation rows (default: "below")
+---@field layout_solver? string Name of the layout solver to use (default: "greedy")
 ---@field data_dir? string Directory for storing annotation data (default: ".aside")
 ---@field highlight_groups? table<string, table> Default highlight groups
 
 --- Initialize aside.nvim with the given options
 ---@param opts? Aside.SetupOpts
 function M.setup(opts)
-  config.setup(opts or {})
+  if nvim.fn.has("nvim-0.11") == 0 then
+    nvim.notify("aside.nvim requires Neovim 0.11 or later", nvim.log.levels.ERROR)
+    return
+  end
+
+  local setup_opts = nvim.deepcopy(opts or {})
+  if setup_opts.default_gutter_icon ~= nil and nvim.fn.strdisplaywidth(setup_opts.default_gutter_icon) ~= 1 then
+    nvim.notify("aside: default_gutter_icon must be display-width 1", nvim.log.levels.ERROR)
+    setup_opts.default_gutter_icon = nil
+  end
+
+  config.setup(setup_opts)
   state.initialize()
   persistence.setup()
   display.setup()
@@ -42,6 +57,9 @@ end
 ---@field display? "hidden"|"hover"|"below"|"aside" Display mode
 ---@field gutter_icon? string Gutter icon for hover mode
 ---@field context_lines? number Lines of context to store
+---@field aside_width? number Width of the aside panel (default: 40)
+---@field spill_direction? "above"|"below" Direction to spill overflow annotation rows (default: "below")
+---@field layout_solver? string Name of the layout solver to use (default: "greedy")
 ---@field highlight_groups? table<string, string> Highlight group overrides
 
 --- Create or get an existing family

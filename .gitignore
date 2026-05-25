@@ -1,1 +1,3 @@
 /.aside/
+/.omo/
+/test/tmux/snapshots/*.actual.txt

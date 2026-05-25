@@ -219,7 +219,7 @@ T["state"]["event unsubscribe works"] = function()
 end
 
 T["state"]["delete_family removes all annotations"] = function()
-  child.lua([[
+  child.lua([[ 
     require("aside").add_annotation({
       family = "to_delete",
       file = "/tmp/test.lua",
@@ -246,8 +246,55 @@ T["state"]["delete_family removes all annotations"] = function()
   eq(exists, false)
 end
 
+T["aside.set_family"] = MiniTest.new_set()
+
+T["aside.set_family"]["refuses when buffer has unsaved edits"] = function()
+  child.lua([[ 
+    local d = require("aside.display.aside")
+    d._test_set_data(999, {
+      win = 999,
+      buf = 999,
+      family = "family_a",
+      source_path = "/test/file.lua",
+      layout = nil,
+      in_insert = false,
+      deferred_render = false,
+      modified = true,
+      augroup_name = "test_augroup",
+    })
+    d.set_family(999, "family_b")
+    _G.result_family = d._test_get_data(999).family
+  ]])
+
+  local result = child.lua_get("_G.result_family")
+  eq(result, "family_a")
+end
+
+T["aside.set_family"]["allows switch when buffer is clean"] = function()
+  child.lua([[ 
+    local d = require("aside.display.aside")
+    d._test_set_data(998, {
+      win = 998,
+      buf = 998,
+      family = "family_a",
+      source_path = "/test/file.lua",
+      layout = nil,
+      in_insert = false,
+      deferred_render = false,
+      modified = false,
+      augroup_name = "test_augroup2",
+    })
+    require("aside.state").ensure_family("family_b")
+    d.set_family(998, "family_b")
+    _G.result_family2 = d._test_get_data(998).family
+  ]])
+
+  local result = child.lua_get("_G.result_family2")
+  eq(result, "family_b")
+end
+
 T["annotations"]["missing family returns nil"] = function()
-  child.lua([[
+  child.lua([[ 
     _G.result = require("aside").add_annotation({
       file = "/tmp/test.lua",
       start_line = 1,
@@ -804,6 +851,461 @@ T["families"]["family config overrides global defaults"] = function()
 
   eq(display, "aside")
   eq(context, 10)
+end
+
+-- ============================================================================
+-- Spec Set 1: layout.greedy — Greedy solver
+-- ============================================================================
+
+T["layout.greedy"] = MiniTest.new_set({
+  hooks = {
+    pre_case = function()
+      child.restart({ "-u", "test/init_minimal.lua" })
+    end,
+  },
+})
+
+T["layout.greedy"]["empty annotations returns source_line_count rows"] = function()
+  child.lua([[
+    local g = require("aside.layout").get("greedy")
+    local r = g.solve({}, 10, { spill_direction = "below", wrap_width = 30, gutter_icon = "*" })
+    _G.row_count = #r.rows
+    _G.virt_count = vim.tbl_count(r.virt_lines_by_source_line)
+  ]])
+  eq(child.lua_get("_G.row_count"), 10)
+  eq(child.lua_get("_G.virt_count"), 0)
+end
+
+T["layout.greedy"]["single annotation fits anchor span"] = function()
+  child.lua([[
+    local g = require("aside.layout").get("greedy")
+    local ann = { id = "a1", family = "f", file = "f", start_line = 3, end_line = 5, title = "T", contents = "", sort_key = nil, created_at = 1 }
+    local r = g.solve({ ann }, 10, { spill_direction = "below", wrap_width = 30, gutter_icon = "*" })
+    _G.row3_ann = r.rows[3].ann_id
+    _G.row3_anchor = r.rows[3].is_anchor
+    _G.row5_anchor = r.rows[5].is_anchor
+  ]])
+  eq(child.lua_get("_G.row3_ann"), "a1")
+  eq(child.lua_get("_G.row3_anchor"), true)
+  eq(child.lua_get("_G.row5_anchor"), true)
+end
+
+T["layout.greedy"]["annotation spills below anchor when content exceeds span"] = function()
+  child.lua([[
+    local g = require("aside.layout").get("greedy")
+    local ann = { id = "a1", family = "f", file = "f", start_line = 5, end_line = 5, title = "T", contents = "l1\nl2\nl3", sort_key = nil, created_at = 1 }
+    local r = g.solve({ ann }, 10, { spill_direction = "below", wrap_width = 30, gutter_icon = "*" })
+    local span = 0
+    for _, row in ipairs(r.rows) do
+      if row.ann_id == "a1" then span = span + 1 end
+    end
+    _G.span = span
+  ]])
+  -- title (1) + 3 content lines = 4 rows minimum
+  eq(child.lua_get("_G.span >= 4"), true)
+end
+
+T["layout.greedy"]["single-line anchor has single positions"] = function()
+  child.lua([[
+    local g = require("aside.layout").get("greedy")
+    local ann = { id = "a1", family = "f", file = "f", start_line = 5, end_line = 5, title = "T", contents = "", sort_key = nil, created_at = 1 }
+    local r = g.solve({ ann }, 10, { spill_direction = "below", wrap_width = 30, gutter_icon = "*" })
+    _G.ap = r.rows[5].anchor_position
+    _G.bp = r.rows[5].box_position
+  ]])
+  eq(child.lua_get("_G.ap"), "single")
+  eq(child.lua_get("_G.bp"), "single")
+end
+
+T["layout.greedy"]["multi-line anchor produces top/middle/bottom positions"] = function()
+  child.lua([[
+    local g = require("aside.layout").get("greedy")
+    local ann = { id = "a1", family = "f", file = "f", start_line = 3, end_line = 5, title = "T", contents = "", sort_key = nil, created_at = 1 }
+    local r = g.solve({ ann }, 10, { spill_direction = "below", wrap_width = 30, gutter_icon = "*" })
+    _G.top = r.rows[3].anchor_position
+    _G.middle = r.rows[4].anchor_position
+    _G.bottom = r.rows[5].anchor_position
+  ]])
+  eq(child.lua_get("_G.top"), "top")
+  eq(child.lua_get("_G.middle"), "middle")
+  eq(child.lua_get("_G.bottom"), "bottom")
+end
+
+T["layout.greedy"]["spill_direction above claims rows above anchor"] = function()
+  child.lua([[
+    local g = require("aside.layout").get("greedy")
+    local ann = { id = "a1", family = "f", file = "f", start_line = 10, end_line = 10, title = "T", contents = "l1\nl2\nl3", sort_key = nil, created_at = 1 }
+    local r = g.solve({ ann }, 15, { spill_direction = "above", wrap_width = 30, gutter_icon = "*" })
+    -- spill above: row at line 7,8,9 should belong to a1 (anchor at 10)
+    _G.line7 = r.rows[7].ann_id
+    _G.line9 = r.rows[9].ann_id
+    _G.line10_anchor = r.rows[10].is_anchor
+  ]])
+  eq(child.lua_get("_G.line7"), "a1")
+  eq(child.lua_get("_G.line9"), "a1")
+  eq(child.lua_get("_G.line10_anchor"), true)
+end
+
+T["layout.greedy"]["all non-conflicting annotations appear in result"] = function()
+  child.lua([[
+    local g = require("aside.layout").get("greedy")
+    local anns = {
+      { id = "X", family = "f", file = "f", start_line = 1, end_line = 1, title = "X", contents = "", sort_key = 2, created_at = 100 },
+      { id = "Y", family = "f", file = "f", start_line = 5, end_line = 5, title = "Y", contents = "", sort_key = 1, created_at = 200 },
+      { id = "Z", family = "f", file = "f", start_line = 10, end_line = 10, title = "Z", contents = "", sort_key = nil, created_at = 50 },
+    }
+    local r = g.solve(anns, 20, { spill_direction = "below", wrap_width = 30, gutter_icon = "*" })
+    local seen = {}
+    for _, row in ipairs(r.rows) do
+      if row.ann_id then seen[row.ann_id] = true end
+    end
+    _G.has_X = seen.X == true
+    _G.has_Y = seen.Y == true
+    _G.has_Z = seen.Z == true
+  ]])
+  eq(child.lua_get("_G.has_X"), true)
+  eq(child.lua_get("_G.has_Y"), true)
+  eq(child.lua_get("_G.has_Z"), true)
+end
+
+-- ============================================================================
+-- Spec Set 2: display.aside_extmarks — Extmark role manager
+-- ============================================================================
+
+T["display.aside_extmarks"] = MiniTest.new_set({
+  hooks = {
+    pre_case = function()
+      child.restart({ "-u", "test/init_minimal.lua" })
+    end,
+  },
+})
+
+T["display.aside_extmarks"]["clear on empty buffer is no-op"] = function()
+  child.lua([[
+    local e = require("aside.display.aside_extmarks")
+    local buf = vim.api.nvim_create_buf(false, true)
+    e.clear(buf)
+    _G.ok = true
+  ]])
+  eq(child.lua_get("_G.ok"), true)
+end
+
+T["display.aside_extmarks"]["place with empty layout adds no extmarks"] = function()
+  child.lua([[
+    local e = require("aside.display.aside_extmarks")
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "line1" })
+    e.place(buf, {
+      rows = { { source_line = 1, ann_id = nil, row_kind = "empty", text = "", is_anchor = false, box_position = "none", anchor_position = "none" } },
+      virt_lines_by_source_line = {},
+    })
+    local ns = vim.api.nvim_create_namespace("aside_edit_regions")
+    local marks = vim.api.nvim_buf_get_extmarks(buf, ns, 0, -1, {})
+    _G.mark_count = #marks
+  ]])
+  eq(child.lua_get("_G.mark_count"), 0)
+end
+
+T["display.aside_extmarks"]["get_role_at returns none for unmarked row"] = function()
+  child.lua([[
+    local e = require("aside.display.aside_extmarks")
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "line1" })
+    _G.role = e.get_role_at(buf, 0)
+  ]])
+  eq(child.lua_get("_G.role"), "none")
+end
+
+T["display.aside_extmarks"]["place title row creates seg_start mark"] = function()
+  child.lua([[
+    local e = require("aside.display.aside_extmarks")
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "* Title" })
+    e.place(buf, {
+      rows = {
+        { source_line = 1, ann_id = "x1", row_kind = "title", segment_idx = 0, text = "* Title", is_anchor = true, box_position = "single", anchor_position = "single" },
+      },
+      virt_lines_by_source_line = {},
+    })
+    _G.role = e.get_role_at(buf, 0)
+  ]])
+  eq(child.lua_get("_G.role"), "seg_start")
+end
+
+T["display.aside_extmarks"]["get_namespace_id returns a number"] = function()
+  child.lua([[
+    local e = require("aside.display.aside_extmarks")
+    local ns = e.get_namespace_id()
+    _G.is_number = type(ns) == "number"
+  ]])
+  eq(child.lua_get("_G.is_number"), true)
+end
+
+-- ============================================================================
+-- Spec Set 3: display.aside_save — Save parser
+-- ============================================================================
+
+T["display.aside_save"] = MiniTest.new_set({
+  hooks = {
+    pre_case = function()
+      child.restart({ "-u", "test/init_minimal.lua" })
+    end,
+  },
+})
+
+T["display.aside_save"]["parse on empty layout returns empty result"] = function()
+  child.lua([[
+    local s = require("aside.display.aside_save")
+    local buf = vim.api.nvim_create_buf(false, true)
+    local r = s.parse(buf, { rows = {}, virt_lines_by_source_line = {} }, "test")
+    _G.updates = vim.tbl_count(r.updates)
+    _G.deletions = #r.deletions
+    _G.type_creates = #r.type_creates
+  ]])
+  eq(child.lua_get("_G.updates"), 0)
+  eq(child.lua_get("_G.deletions"), 0)
+  eq(child.lua_get("_G.type_creates"), 0)
+end
+
+T["display.aside_save"]["type_creates field is always present"] = function()
+  child.lua([[
+    local s = require("aside.display.aside_save")
+    local buf = vim.api.nvim_create_buf(false, true)
+    local r = s.parse(buf, { rows = {}, virt_lines_by_source_line = {} }, "test")
+    _G.has_type_creates = type(r.type_creates) == "table"
+  ]])
+  eq(child.lua_get("_G.has_type_creates"), true)
+end
+
+T["display.aside_save"]["parse with invalid buffer returns empty result"] = function()
+  child.lua([[
+    local s = require("aside.display.aside_save")
+    local r = s.parse(999999, { rows = {}, virt_lines_by_source_line = {} }, "test")
+    _G.updates = vim.tbl_count(r.updates)
+    _G.deletions = #r.deletions
+    _G.type_creates = #r.type_creates
+  ]])
+  eq(child.lua_get("_G.updates"), 0)
+  eq(child.lua_get("_G.deletions"), 0)
+  eq(child.lua_get("_G.type_creates"), 0)
+end
+
+T["display.aside_save"]["parse detects type-to-create on out-of-region line"] = function()
+  child.lua([[
+    local s = require("aside.display.aside_save")
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "new annotation here" })
+    local layout = {
+      rows = {
+        { source_line = 1, ann_id = nil, row_kind = "empty", text = "", is_anchor = false, box_position = "none", anchor_position = "none" },
+      },
+      virt_lines_by_source_line = {},
+    }
+    local r = s.parse(buf, layout, "test")
+    _G.tc_count = #r.type_creates
+    if #r.type_creates > 0 then
+      _G.tc_contents = r.type_creates[1].contents
+      _G.tc_source_line = r.type_creates[1].source_line
+    end
+  ]])
+  eq(child.lua_get("_G.tc_count"), 1)
+  eq(child.lua_get("_G.tc_contents"), "new annotation here")
+  eq(child.lua_get("_G.tc_source_line"), 1)
+end
+
+T["display.aside_save"]["commit no-op for empty parse_result"] = function()
+  child.lua([[
+    local s = require("aside.display.aside_save")
+    local actions = s.commit({ updates = {}, deletions = {}, type_creates = {} }, 1, nil, nil)
+    _G.action_count = #actions
+  ]])
+  eq(child.lua_get("_G.action_count"), 0)
+end
+
+-- ============================================================================
+-- Spec Set 4: display.aside lifecycle
+-- ============================================================================
+
+T["display.aside lifecycle"] = MiniTest.new_set({
+  hooks = {
+    pre_case = function()
+      child.restart({ "-u", "test/init_minimal.lua" })
+    end,
+  },
+})
+
+T["display.aside lifecycle"]["set_family refuses when modified"] = function()
+  child.lua([[
+    local d = require("aside.display.aside")
+    d._test_set_data(7777, {
+      win = 7777, buf = 7777, family = "family_a", source_path = "/test/file.lua",
+      layout = nil, in_insert = false, deferred_render = false, modified = true, augroup_name = "test_ag_life1",
+    })
+    d.set_family(7777, "family_b")
+    _G.family = d._test_get_data(7777).family
+  ]])
+  eq(child.lua_get("_G.family"), "family_a")
+end
+
+T["display.aside lifecycle"]["set_family allows switch when clean"] = function()
+  child.lua([[
+    local d = require("aside.display.aside")
+    require("aside.state").ensure_family("family_b")
+    d._test_set_data(7778, {
+      win = 7778, buf = 7778, family = "family_a", source_path = "/test/file.lua",
+      layout = nil, in_insert = false, deferred_render = false, modified = false, augroup_name = "test_ag_life2",
+    })
+    d.set_family(7778, "family_b")
+    _G.family = d._test_get_data(7778).family
+  ]])
+  eq(child.lua_get("_G.family"), "family_b")
+end
+
+T["display.aside lifecycle"]["refresh_if_visible defers when in_insert"] = function()
+  child.lua([[
+    local d = require("aside.display.aside")
+    d._test_set_data(7779, {
+      win = 7779, buf = 7779, family = "f", source_path = "/test/f.lua",
+      layout = nil, in_insert = true, deferred_render = false, modified = false, augroup_name = "test_ag_life3",
+    })
+    local buf = vim.api.nvim_create_buf(false, true)
+    pcall(vim.api.nvim_buf_set_name, buf, "/test/f.lua")
+    d.refresh_if_visible(buf)
+    _G.deferred = d._test_get_data(7779).deferred_render
+  ]])
+  eq(child.lua_get("_G.deferred"), true)
+end
+
+T["display.aside lifecycle"]["close on unknown source_win is no-op"] = function()
+  child.lua([[
+    local d = require("aside.display.aside")
+    d.close(123456)
+    _G.ok = true
+  ]])
+  eq(child.lua_get("_G.ok"), true)
+end
+
+-- ============================================================================
+-- Spec Set 5: config validation
+-- ============================================================================
+
+T["config validation"] = MiniTest.new_set({
+  hooks = {
+    pre_case = function()
+      child.restart({ "-u", "test/init_minimal.lua" })
+    end,
+  },
+})
+
+T["config validation"]["aside_width default is 40"] = function()
+  child.lua([[ _G.val = require("aside.config").get_value("aside_width", nil) ]])
+  eq(child.lua_get("_G.val"), 40)
+end
+
+T["config validation"]["spill_direction default is below"] = function()
+  child.lua([[ _G.val = require("aside.config").get_value("spill_direction", nil) ]])
+  eq(child.lua_get("_G.val"), "below")
+end
+
+T["config validation"]["invalid spill_direction is rejected by family configure"] = function()
+  child.lua([[
+    local f = require("aside").ensure_family("test_cfg_spill")
+    _G.before = f:get_config().spill_direction
+    f:configure({ spill_direction = "sideways" })
+    _G.after = f:get_config().spill_direction
+  ]])
+  -- Should be unchanged (rejected)
+  eq(child.lua_get("_G.after"), child.lua_get("_G.before"))
+end
+
+T["config validation"]["gutter_icon width 2 is rejected by family configure"] = function()
+  child.lua([[
+    local f = require("aside").ensure_family("test_cfg_icon")
+    _G.before = f:get_config().gutter_icon
+    f:configure({ gutter_icon = "AB" })
+    _G.after = f:get_config().gutter_icon
+  ]])
+  eq(child.lua_get("_G.after"), child.lua_get("_G.before"))
+end
+
+T["config validation"]["valid spill_direction 'above' is accepted"] = function()
+  child.lua([[
+    local f = require("aside").ensure_family("test_cfg_above")
+    f:configure({ spill_direction = "above" })
+    _G.dir = f:get_config().spill_direction
+  ]])
+  eq(child.lua_get("_G.dir"), "above")
+end
+
+-- ============================================================================
+-- Spec Set 6: layout.types
+-- ============================================================================
+
+T["layout.types"] = MiniTest.new_set({
+  hooks = {
+    pre_case = function()
+      child.restart({ "-u", "test/init_minimal.lua" })
+    end,
+  },
+})
+
+T["layout.types"]["module loads without errors"] = function()
+  child.lua([[
+    require("aside.layout.types")
+    _G.ok = true
+  ]])
+  eq(child.lua_get("_G.ok"), true)
+end
+
+T["layout.types"]["module exports empty table (no public methods)"] = function()
+  child.lua([[
+    local t = require("aside.layout.types")
+    _G.is_table = type(t) == "table"
+    local count = 0
+    for _ in pairs(t) do count = count + 1 end
+    _G.method_count = count
+  ]])
+  eq(child.lua_get("_G.is_table"), true)
+  eq(child.lua_get("_G.method_count"), 0)
+end
+
+-- ============================================================================
+-- Spec Set 7: layout.solver interface (registry)
+-- ============================================================================
+
+T["layout.solver interface"] = MiniTest.new_set({
+  hooks = {
+    pre_case = function()
+      child.restart({ "-u", "test/init_minimal.lua" })
+    end,
+  },
+})
+
+T["layout.solver interface"]["greedy solver is registered"] = function()
+  child.lua([[
+    local solver = require("aside.layout").get("greedy")
+    _G.has_solve = type(solver.solve) == "function"
+  ]])
+  eq(child.lua_get("_G.has_solve"), true)
+end
+
+T["layout.solver interface"]["unknown solver raises error"] = function()
+  child.lua([[
+    local ok, err = pcall(require("aside.layout").get, "nonexistent_xyz")
+    _G.ok = ok
+    _G.err_has_msg = err ~= nil and err:find("aside: unknown layout solver") ~= nil
+  ]])
+  eq(child.lua_get("_G.ok"), false)
+  eq(child.lua_get("_G.err_has_msg"), true)
+end
+
+T["layout.solver interface"]["solve convenience delegates to registered solver"] = function()
+  child.lua([[
+    local layout = require("aside.layout")
+    local r = layout.solve("greedy", {}, 5, { spill_direction = "below", wrap_width = 30, gutter_icon = "*" })
+    _G.row_count = #r.rows
+  ]])
+  eq(child.lua_get("_G.row_count"), 5)
 end
 
 return T
