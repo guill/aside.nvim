@@ -1,5 +1,3 @@
----@diagnostic disable: undefined-global,trailing-space
-local nvim = _G.vim
 local M = {}
 
 local config = require("aside.config")
@@ -35,35 +33,35 @@ function FamilyMethods:configure(opts)
   opts = opts or {}
 
   if opts.spill_direction ~= nil and opts.spill_direction ~= "above" and opts.spill_direction ~= "below" then
-    nvim.notify("aside: spill_direction must be 'above' or 'below'", nvim.log.levels.ERROR)
+    vim.notify("aside: spill_direction must be 'above' or 'below'", vim.log.levels.ERROR)
     return
   end
 
   if opts.aside_width ~= nil and (type(opts.aside_width) ~= "number" or math.floor(opts.aside_width) ~= opts.aside_width or opts.aside_width <= 0) then
-    nvim.notify("aside: aside_width must be a positive integer", nvim.log.levels.ERROR)
+    vim.notify("aside: aside_width must be a positive integer", vim.log.levels.ERROR)
     return
   end
 
   if opts.layout_solver ~= nil and type(opts.layout_solver) ~= "string" then
-    nvim.notify("aside: layout_solver must be a string", nvim.log.levels.ERROR)
+    vim.notify("aside: layout_solver must be a string", vim.log.levels.ERROR)
     return
   end
 
   if opts.gutter_icon ~= nil then
-    local width = nvim.fn.strdisplaywidth(opts.gutter_icon)
+    local width = vim.fn.strdisplaywidth(opts.gutter_icon)
     if width ~= 1 then
-      nvim.notify(string.format("aside: gutter_icon must be display-width 1; got width %d for '%s'", width, opts.gutter_icon), nvim.log.levels.ERROR)
+      vim.notify(string.format("aside: gutter_icon must be display-width 1; got width %d for '%s'", width, opts.gutter_icon), vim.log.levels.ERROR)
       return
     end
   end
 
-  self.config = nvim.tbl_deep_extend("force", self.config, opts or {})
+  self.config = vim.tbl_deep_extend("force", self.config, opts or {})
   require("aside.display").refresh_family(self.name)
 end
 
 function FamilyMethods:get_config()
   local global_config = config.get()
-  return nvim.tbl_deep_extend("force", {
+  return vim.tbl_deep_extend("force", {
     display = global_config.default_display,
     gutter_icon = global_config.default_gutter_icon,
     context_lines = global_config.context_lines,
@@ -158,7 +156,7 @@ function M.update_annotation(id, updates)
     return nil
   end
 
-  local old_annotation = nvim.deepcopy(annotation)
+  local old_annotation = vim.deepcopy(annotation)
 
   for key, value in pairs(updates) do
     annotation[key] = value
@@ -234,7 +232,7 @@ function M.emit(event, data)
   for _, callback in ipairs(event_listeners[event] or {}) do
     local ok, err = pcall(callback, data)
     if not ok then
-      nvim.notify("aside.nvim event error: " .. tostring(err), nvim.log.levels.ERROR)
+      vim.notify("aside.nvim event error: " .. tostring(err), vim.log.levels.ERROR)
     end
   end
 end

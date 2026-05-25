@@ -1,4 +1,3 @@
----@diagnostic disable: undefined-global,trailing-space
 ---@mod aside.nvim Annotation tracking and display library for Neovim
 ---@brief [[
 --- aside.nvim provides APIs for tracking and displaying annotations in code files.
@@ -6,7 +5,6 @@
 ---@brief ]]
 
 local M = {}
-local nvim = vim
 local config = require("aside.config")
 local state = require("aside.state")
 local annotations = require("aside.annotations")
@@ -27,15 +25,27 @@ local display = require("aside.display")
 --- Initialize aside.nvim with the given options
 ---@param opts? Aside.SetupOpts
 function M.setup(opts)
-  if nvim.fn.has("nvim-0.11") == 0 then
-    nvim.notify("aside.nvim requires Neovim 0.11 or later", nvim.log.levels.ERROR)
+  if vim.fn.has("nvim-0.11") == 0 then
+    vim.notify("aside.nvim requires Neovim 0.11 or later", vim.log.levels.ERROR)
     return
   end
 
-  local setup_opts = nvim.deepcopy(opts or {})
-  if setup_opts.default_gutter_icon ~= nil and nvim.fn.strdisplaywidth(setup_opts.default_gutter_icon) ~= 1 then
-    nvim.notify("aside: default_gutter_icon must be display-width 1", nvim.log.levels.ERROR)
+  local setup_opts = vim.deepcopy(opts or {})
+  if setup_opts.default_gutter_icon ~= nil and vim.fn.strdisplaywidth(setup_opts.default_gutter_icon) ~= 1 then
+    vim.notify("aside: default_gutter_icon must be display-width 1", vim.log.levels.ERROR)
     setup_opts.default_gutter_icon = nil
+  end
+  if setup_opts.spill_direction ~= nil and setup_opts.spill_direction ~= "above" and setup_opts.spill_direction ~= "below" then
+    vim.notify("aside: spill_direction must be 'above' or 'below'", vim.log.levels.ERROR)
+    setup_opts.spill_direction = nil
+  end
+  if setup_opts.aside_width ~= nil and (type(setup_opts.aside_width) ~= "number" or math.floor(setup_opts.aside_width) ~= setup_opts.aside_width or setup_opts.aside_width <= 0) then
+    vim.notify("aside: aside_width must be a positive integer", vim.log.levels.ERROR)
+    setup_opts.aside_width = nil
+  end
+  if setup_opts.layout_solver ~= nil and type(setup_opts.layout_solver) ~= "string" then
+    vim.notify("aside: layout_solver must be a string", vim.log.levels.ERROR)
+    setup_opts.layout_solver = nil
   end
 
   config.setup(setup_opts)

@@ -1,5 +1,3 @@
----@diagnostic disable: undefined-global,trailing-space
-local nvim = _G.vim
 local M = {}
 
 local defaults = {
@@ -20,10 +18,10 @@ local defaults = {
   },
 }
 
-local config = nvim.deepcopy(defaults)
+local config = vim.deepcopy(defaults)
 
 function M.setup(opts)
-  config = nvim.tbl_deep_extend("force", nvim.deepcopy(defaults), opts or {})
+  config = vim.tbl_deep_extend("force", vim.deepcopy(defaults), opts or {})
   M.setup_highlights()
 end
 
@@ -40,7 +38,7 @@ function M.get_value(key, default)
 end
 
 function M.setup_highlights()
-  local bg = nvim.o.background
+  local bg = vim.o.background
 
   local highlight_defs = {
     AsideTitle = {
@@ -68,11 +66,11 @@ function M.setup_highlights()
   for group, colors in pairs(highlight_defs) do
     local hl_opts = bg == "light" and colors.light or colors.dark
     hl_opts.default = true
-    nvim.api.nvim_set_hl(0, group, hl_opts)
+    vim.api.nvim_set_hl(0, group, hl_opts)
   end
 
-  nvim.api.nvim_create_autocmd("ColorScheme", {
-    group = nvim.api.nvim_create_augroup("AsideHighlights", { clear = true }),
+  vim.api.nvim_create_autocmd("ColorScheme", {
+    group = vim.api.nvim_create_augroup("AsideHighlights", { clear = true }),
     callback = function()
       M.setup_highlights()
     end,
@@ -81,8 +79,8 @@ end
 
 function M.get_data_dir()
   local data_dir = config.data_dir
-  if not nvim.startswith(data_dir, "/") then
-    data_dir = nvim.fn.getcwd() .. "/" .. data_dir
+  if not vim.startswith(data_dir, "/") then
+    data_dir = vim.fn.getcwd() .. "/" .. data_dir
   end
   return data_dir
 end

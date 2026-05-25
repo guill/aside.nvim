@@ -40,7 +40,12 @@ function M.add(opts)
   if end_line < start_line then
     start_line, end_line = end_line, start_line
   end
-  
+
+  if opts.title and opts.title:find("\n", 1, true) then
+    vim.notify("aside: title must not contain newlines", vim.log.levels.ERROR)
+    return nil
+  end
+
   local family = state.get_family(family_name)
   local family_config = family:get_config()
   local context_data = context.capture(file, start_line, end_line, family_config.context_lines)
@@ -122,7 +127,12 @@ function M.update(id, updates)
   if not annotation then
     return false
   end
-  
+
+  if updates.title and updates.title:find("\n", 1, true) then
+    vim.notify("aside: title must not contain newlines", vim.log.levels.ERROR)
+    return false
+  end
+
   local allowed_fields = { "title", "contents", "sort_key", "metadata" }
   local filtered_updates = {}
   for _, field in ipairs(allowed_fields) do

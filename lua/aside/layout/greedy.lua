@@ -1,5 +1,3 @@
----@diagnostic disable: undefined-global, undefined-field
-local nvim = _G.vim
 local M = {}
 
 -- Split a single logical line (no newlines inside) into chunks of at most
@@ -32,7 +30,7 @@ end
 -- Take an annotation's full `contents` string (may have \n separators) and
 -- return an ordered list of wrapped chunks ready for placement.
 local function wrap_content(text, width)
-  local logical = nvim.split(text, "\n", { plain = true })
+  local logical = vim.split(text, "\n", { plain = true })
   local result = {}
   for _, line in ipairs(logical) do
     if line == "" then
@@ -97,15 +95,8 @@ local function compute_rendered_rows(ann, wrap_width)
     rendered = rendered + 1
   end
   if ann.contents and ann.contents ~= "" then
-    local lines = nvim.split(ann.contents, "\n", { plain = true })
-    for _, line in ipairs(lines) do
-      if line == "" then
-        rendered = rendered + 1
-      else
-        local n = math.max(1, math.ceil(#line / math.max(1, wrap_width)))
-        rendered = rendered + n
-      end
-    end
+    local chunks = wrap_content(ann.contents, wrap_width)
+    rendered = rendered + #chunks
   end
   if rendered == 0 then
     rendered = 1

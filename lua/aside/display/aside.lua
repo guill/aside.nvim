@@ -51,18 +51,26 @@ function M.setup()
     group = vim.api.nvim_create_augroup("AsidePanelClose", { clear = true }),
     callback = function(args)
       local closed_win = tonumber(args.match)
+      local aside_panel_source = nil
+      local source_win_closed = nil
       for source_win, aside_data in pairs(aside_windows) do
         if aside_data.win == closed_win then
-          if aside_data.augroup_name then
-            pcall(vim.api.nvim_del_augroup_by_name, aside_data.augroup_name)
-          end
-          aside_windows[source_win] = nil
+          aside_panel_source = source_win
           break
         end
         if source_win == closed_win then
-          M.close(source_win)
+          source_win_closed = source_win
           break
         end
+      end
+      if aside_panel_source then
+        local aside_data = aside_windows[aside_panel_source]
+        if aside_data and aside_data.augroup_name then
+          pcall(vim.api.nvim_del_augroup_by_name, aside_data.augroup_name)
+        end
+        aside_windows[aside_panel_source] = nil
+      elseif source_win_closed then
+        M.close(source_win_closed)
       end
     end,
   })
@@ -217,6 +225,20 @@ function M.open(opts)
         return
       end
       aside_data.in_insert = false
+      if aside_data.pending_family then
+        if aside_data.modified then
+          vim.notify(
+            "aside: unsaved changes; :w or :e! before switching family",
+            vim.log.levels.ERROR
+          )
+          return
+        end
+        local pending = aside_data.pending_family
+        aside_data.pending_family = nil
+        aside_data.deferred_render = false
+        M.set_family(source_win, pending)
+        return
+      end
       if aside_data.deferred_render then
         aside_data.deferred_render = false
         vim.schedule(function()
@@ -367,6 +389,11 @@ function M.set_family(win, family_name)
       "aside: unsaved changes; :w or :e! before switching family",
       vim.log.levels.ERROR
     )
+    return
+  end
+  if aside_data.in_insert then
+    aside_data.pending_family = family_name
+    aside_data.deferred_render = true
     return
   end
   if not state.family_exists(family_name) then
