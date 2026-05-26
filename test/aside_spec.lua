@@ -1434,6 +1434,37 @@ T["display.aside scroll sync"]["round-trip sync is stable (no drift)"] = functio
        .. " to " .. tostring(roundtrip))
 end
 
+T["display.aside scroll sync"]["foreign virt_lines on source do not skew aside"] = function()
+  setup_long_source_with_aside(child)
+  child.lua([[
+    -- Another plugin places virt_lines on the source buffer. The aside sync
+    -- must IGNORE these (they aren't part of our layout) so source line N
+    -- still aligns with aside row N + (our virt count below N).
+    local foreign_ns = vim.api.nvim_create_namespace("foreign_plugin")
+    for line = 9, 0, -1 do
+      pcall(vim.api.nvim_buf_set_extmark, _G.source_buf, foreign_ns, line, 0, {
+        virt_lines = { { { "FOREIGN", "Comment" } }, { { "FOREIGN2", "Comment" } } },
+        virt_lines_above = false,
+      })
+    end
+
+    local mod = require("aside.display.aside")
+    vim.fn.win_execute(_G.source_win, "normal! 100Gzt", true)
+    mod.sync_scroll(_G.source_win, _G.source_win)
+    _G.src_top = vim.fn.line("w0", _G.source_win)
+    _G.aside_top = vim.fn.line("w0", _G.aside_win)
+  ]])
+  local src = child.lua_get("_G.src_top")
+  local aside = child.lua_get("_G.aside_top")
+  eq(src, 100)
+  -- Without the fix, foreign virt_lines (20 of them above source line 100)
+  -- would shift aside_top to ~120. With the fix, only our own virt_lines
+  -- matter; the annotation is at line 150 so there are no virt_lines above
+  -- line 100, and aside_top must equal source_top.
+  eq(aside, 100,
+     "aside skewed by foreign virt_lines: expected 100, got " .. tostring(aside))
+end
+
 T["display.aside scroll sync"]["repeated ping-pong syncs do not ladder"] = function()
   setup_long_source_with_aside(child)
   child.lua([[

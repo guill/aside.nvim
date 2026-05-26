@@ -467,10 +467,32 @@ function M.sync_scroll(source_win, scrolled_win)
   _syncing = false
 end
 
---- Sync the aside panel topline to match the source window's visual scroll
---- offset. Counts visual rows (including wrap, folds, virt_lines) above the
---- source topline and applies the same row offset to the aside (which has
---- wrap=false / no folds, so visual rows == buffer rows).
+--- Compute the aside-row offset corresponding to source buffer line `S`.
+--- Defined as: (S - 1) + (sum of our own virt_lines below source lines < S).
+---
+--- This DELIBERATELY ignores `nvim_win_text_height` so that wrap rows in the
+--- source pane AND virt_lines inserted by other plugins do not skew the sync.
+--- The aside layout is indexed by source buffer line, not source visual row.
+---@param aside_data table aside_windows[source_win] entry
+---@param S integer 1-indexed source buffer line
+---@return integer offset 0-indexed offset of source line S in the aside buffer
+local function aside_offset_for_source_line(aside_data, S)
+  if S <= 1 then return 0 end
+  local virt = aside_data.layout and aside_data.layout.virt_lines_by_source_line
+  if not virt then return S - 1 end
+  local offset = S - 1
+  for src_line, count in pairs(virt) do
+    if src_line < S and count and count > 0 then
+      offset = offset + count
+    end
+  end
+  return offset
+end
+
+--- Sync the aside panel topline to match the source window's buffer-line
+--- position. We use the source BUFFER offset plus our layout's virt_lines,
+--- never the visual row count, so other plugins' virt_lines and source-side
+--- wrap rows do not shift the aside.
 ---@param source_win integer
 ---@param aside_data table
 function M._sync_source_to_aside(source_win, aside_data)
@@ -480,26 +502,18 @@ function M._sync_source_to_aside(source_win, aside_data)
     return
   end
 
-  -- Count visual rows for buffer rows [0, source_topline - 2] (0-indexed,
-  -- inclusive). `all` includes wrap, folds, and virt_lines.
-  local ok, result = pcall(vim.api.nvim_win_text_height, source_win, {
-    start_row = 0,
-    end_row = source_topline - 2,
-  })
-  local visual_rows_before = (ok and result and result.all)
-    or (source_topline - 1)
-
-  -- Aside is 1:1 (wrap=false, no folds), so aside topline = offset + 1.
-  local target_aside_row = visual_rows_before + 1
+  local target_aside_row = aside_offset_for_source_line(aside_data, source_topline) + 1
   local aside_line_count = vim.api.nvim_buf_line_count(aside_data.buf)
   target_aside_row = math.max(1, math.min(target_aside_row, aside_line_count))
 
   M._set_topline(aside_data.win, target_aside_row)
 end
 
---- Sync the source window's topline to match the aside panel's visual scroll
---- offset. Binary-searches for the source buffer row whose cumulative visual
---- row count matches the aside's topline offset.
+--- Sync the source window's topline to match the aside panel's topline. The
+--- inverse of `_sync_source_to_aside`: finds the largest source buffer line
+--- `S` whose `aside_offset_for_source_line(S)` does not exceed `aside_topline-1`.
+--- Picking the LARGEST such S (not smallest with offset >= target) keeps the
+--- round-trip stable when our own virt_lines sit between source lines.
 ---@param source_win integer
 ---@param aside_data table
 function M._sync_aside_to_source(source_win, aside_data)
@@ -509,37 +523,16 @@ function M._sync_aside_to_source(source_win, aside_data)
     return
   end
 
-  -- Aside is 1:1 (wrap=false, no folds), so its visual_offset == aside_topline-1.
-  -- We need source_topline S such that visual_offset(source, S) == this value,
-  -- where visual_offset(buf, S) = text_height(start=0, end=S-2).all for S>=2
-  -- and 0 for S==1. This MUST be the inverse of _sync_source_to_aside or the
-  -- two sides drift on round-trips and ladder under feedback.
-  local visual_rows_before = aside_topline - 1
-
+  local target_offset = aside_topline - 1
   local source_buf = vim.api.nvim_win_get_buf(source_win)
   local source_line_count = vim.api.nvim_buf_line_count(source_buf)
 
-  -- Binary search for the largest S in [1, source_line_count] with
-  -- visual_offset(source, S) <= visual_rows_before. Picking the largest such
-  -- S (rather than the smallest S with offset >= target) keeps round-trips
-  -- stable when several source lines map to the same aside_topline (e.g. when
-  -- virt_lines sit between them).
-  local function visual_offset(S)
-    if S <= 1 then return 0 end
-    local ok, result = pcall(vim.api.nvim_win_text_height, source_win, {
-      start_row = 0,
-      end_row = S - 2,
-    })
-    if ok and result and result.all then return result.all end
-    return S - 1
-  end
-
+  -- Upper-mid bias: we want the LARGEST S satisfying the predicate, so round
+  -- up to avoid getting stuck on lo.
   local lo, hi = 1, source_line_count
   while lo < hi do
-    -- Upper-mid bias: we are looking for the largest S that satisfies the
-    -- predicate, so round up to avoid getting stuck on lo.
     local mid = math.floor((lo + hi + 1) / 2)
-    if visual_offset(mid) <= visual_rows_before then
+    if aside_offset_for_source_line(aside_data, mid) <= target_offset then
       lo = mid
     else
       hi = mid - 1
