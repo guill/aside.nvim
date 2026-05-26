@@ -1308,4 +1308,336 @@ T["layout.solver interface"]["solve convenience delegates to registered solver"]
   eq(child.lua_get("_G.row_count"), 5)
 end
 
+-- ============================================================================
+-- Spec Set 8: display.aside scroll sync (Bug #1)
+--
+-- These tests build a REAL source + aside split pair, populate annotations,
+-- and call sync_scroll directly. WinScrolled does not fire reliably in
+-- headless Neovim, so the tests bypass the autocmd and exercise the sync
+-- logic by invoking the public sync_scroll API with an explicit scrolled-win
+-- argument (after the source-of-truth fix that adds that argument).
+-- ============================================================================
+
+T["display.aside scroll sync"] = MiniTest.new_set({
+  hooks = {
+    pre_case = function()
+      child.restart({ "-u", "test/init_minimal.lua" })
+      child.lua("require('aside').setup({ persistence = { enabled = false } })")
+      -- Give the child UI enough lines for meaningful scrolling.
+      child.o.lines = 30
+      child.o.columns = 120
+    end,
+  },
+})
+
+-- Common setup helper executed inside child: long source buffer + one
+-- annotation around the middle + opened aside panel anchored to the source.
+local function setup_long_source_with_aside(child)
+  child.lua([[
+    local lines = {}
+    for i = 1, 300 do lines[i] = "source line " .. i end
+    local tmp = vim.fn.tempname() .. ".txt"
+    vim.fn.writefile(lines, tmp)
+    vim.cmd("edit " .. tmp)
+    _G.source_win = vim.api.nvim_get_current_win()
+    _G.source_buf = vim.api.nvim_get_current_buf()
+    _G.source_path = tmp
+
+    require("aside").ensure_family("scroll_fam")
+    _G.ann_id = require("aside").add_annotation({
+      family = "scroll_fam",
+      file = tmp,
+      start_line = 150,
+      end_line = 150,
+      title = "Mid annotation",
+      contents = "Just one line",
+    })
+    require("aside").open_aside({ family = "scroll_fam", win = _G.source_win })
+    _G.aside_data = require("aside.display.aside")._test_get_data(_G.source_win)
+    _G.aside_win = _G.aside_data.win
+    _G.aside_buf = _G.aside_data.buf
+  ]])
+end
+
+T["display.aside scroll sync"]["source scroll moves aside (baseline)"] = function()
+  setup_long_source_with_aside(child)
+  child.lua([[
+    vim.fn.win_execute(_G.source_win, "normal! 100Gzt", true)
+    require("aside.display.aside").sync_scroll(_G.source_win, _G.source_win)
+    _G.aside_topline = vim.fn.line("w0", _G.aside_win)
+    _G.source_topline = vim.fn.line("w0", _G.source_win)
+    _G.aside_line_count = vim.api.nvim_buf_line_count(_G.aside_buf)
+  ]])
+  local topline = child.lua_get("_G.aside_topline")
+  local src_top = child.lua_get("_G.source_topline")
+  local n = child.lua_get("_G.aside_line_count")
+  eq(
+    topline >= 95 and topline <= 105,
+    true,
+    "expected aside topline near 100, got aside=" .. tostring(topline)
+      .. " source=" .. tostring(src_top)
+      .. " aside_lines=" .. tostring(n)
+  )
+end
+
+T["display.aside scroll sync"]["open_aside performs initial sync to pre-scrolled source"] = function()
+  child.lua([[
+    local lines = {}
+    for i = 1, 300 do lines[i] = "source line " .. i end
+    local tmp = vim.fn.tempname() .. ".txt"
+    vim.fn.writefile(lines, tmp)
+    vim.cmd("edit " .. tmp)
+    _G.source_win = vim.api.nvim_get_current_win()
+
+    require("aside").ensure_family("init_fam")
+    require("aside").add_annotation({
+      family = "init_fam", file = tmp, start_line = 150, end_line = 150,
+      title = "T", contents = "c",
+    })
+
+    -- Pre-scroll source BEFORE opening the aside panel.
+    vim.fn.win_execute(_G.source_win, "normal! 80Gzt", true)
+    _G.src_before = vim.fn.line("w0", _G.source_win)
+
+    require("aside").open_aside({ family = "init_fam", win = _G.source_win })
+    local d = require("aside.display.aside")._test_get_data(_G.source_win)
+    _G.aside_top = vim.fn.line("w0", d.win)
+    _G.src_after = vim.fn.line("w0", _G.source_win)
+  ]])
+  eq(child.lua_get("_G.src_before"), 80)
+  eq(child.lua_get("_G.src_after"), 80)
+  local at = child.lua_get("_G.aside_top")
+  eq(at >= 75 and at <= 85, true,
+     "expected aside topline near 80 after initial sync, got " .. tostring(at))
+end
+
+T["display.aside scroll sync"]["round-trip sync is stable (no drift)"] = function()
+  setup_long_source_with_aside(child)
+  child.lua([[
+    local mod = require("aside.display.aside")
+    -- Move source to a stable position, sync to aside, then sync back.
+    -- A correct implementation produces source==initial after the roundtrip.
+    vim.fn.win_execute(_G.source_win, "normal! 60Gzt", true)
+    _G.src_initial = vim.fn.line("w0", _G.source_win)
+
+    mod.sync_scroll(_G.source_win, _G.source_win)
+    _G.aside_after_first_sync = vim.fn.line("w0", _G.aside_win)
+
+    -- Now sync from aside back to source. Source must NOT drift.
+    mod.sync_scroll(_G.source_win, _G.aside_win)
+    _G.src_after_roundtrip = vim.fn.line("w0", _G.source_win)
+  ]])
+  local initial = child.lua_get("_G.src_initial")
+  local roundtrip = child.lua_get("_G.src_after_roundtrip")
+  eq(roundtrip, initial,
+     "round-trip drifted: source went from " .. tostring(initial)
+       .. " to " .. tostring(roundtrip))
+end
+
+T["display.aside scroll sync"]["repeated ping-pong syncs do not ladder"] = function()
+  setup_long_source_with_aside(child)
+  child.lua([[
+    local mod = require("aside.display.aside")
+    vim.fn.win_execute(_G.source_win, "normal! 100Gzt", true)
+    _G.src_initial = vim.fn.line("w0", _G.source_win)
+    -- 10 alternating syncs simulate aggressive WinScrolled feedback.
+    for _ = 1, 10 do
+      mod.sync_scroll(_G.source_win, _G.source_win)
+      mod.sync_scroll(_G.source_win, _G.aside_win)
+    end
+    _G.src_after = vim.fn.line("w0", _G.source_win)
+    _G.aside_after = vim.fn.line("w0", _G.aside_win)
+  ]])
+  local initial = child.lua_get("_G.src_initial")
+  local after = child.lua_get("_G.src_after")
+  eq(after, initial,
+     "laddered after 10 cycles: source went from " .. tostring(initial)
+       .. " to " .. tostring(after))
+end
+
+T["display.aside scroll sync"]["aside scroll moves source (BUG #1)"] = function()
+  setup_long_source_with_aside(child)
+  child.lua([[
+    -- Pin source at top, then scroll aside down.
+    vim.fn.win_execute(_G.source_win, "normal! 1Gzt", true)
+    vim.fn.win_execute(_G.aside_win, "normal! 200Gzt", true)
+    -- Sync as though WinScrolled fired for the aside window.
+    require("aside.display.aside").sync_scroll(_G.source_win, _G.aside_win)
+    _G.source_topline = vim.fn.line("w0", _G.source_win)
+    _G.aside_topline = vim.fn.line("w0", _G.aside_win)
+  ]])
+  local source_topline = child.lua_get("_G.source_topline")
+  local aside_topline = child.lua_get("_G.aside_topline")
+  -- After the fix, source should follow aside. Allow modest slack for
+  -- visual-row vs buffer-row arithmetic around the annotation virt rows.
+  eq(source_topline >= 190 and source_topline <= 210,
+     true,
+     "expected source_topline near aside_topline (~200), got source="
+       .. source_topline .. " aside=" .. aside_topline)
+end
+
+-- ============================================================================
+-- Spec Set 9: display.aside statuscolumn glyphs (Bug #2)
+--
+-- The statuscolumn presents two columns:
+--   * outer (left, far from text)   -> ANCHOR position glyphs
+--   * inner (right, adjacent to text) -> BOX (full annotation span) glyphs
+--
+-- Expected per-row glyphs (matching the user's expected output):
+--
+--   anchor_position    -> outer column
+--     top    -> "┐"   bottom -> "┘"   middle -> "│"   single -> "│"
+--     none   -> " "
+--
+--   box_position       -> inner column
+--     top    -> "┌"   bottom -> "└"   middle -> "│"   single -> "─"
+--     none   -> " "
+--
+-- Additionally, a `connector` accent glyph "├┤" appears on a single row
+-- representing the midpoint of the SHORTER of (anchor span, box span).
+-- ============================================================================
+
+T["display.aside statuscolumn"] = MiniTest.new_set({
+  hooks = {
+    pre_case = function()
+      child.restart({ "-u", "test/init_minimal.lua" })
+      child.lua("require('aside').setup({ persistence = { enabled = false } })")
+    end,
+  },
+})
+
+-- Helper executed in the child to build an aside_data fixture with a
+-- precomputed layout, then read the statuscolumn value for a given lnum.
+-- Returns the rendered string after stripping highlight prefixes "%#GROUP#".
+-- vim.v.lnum is read-only, so we pass lnum as an explicit second argument
+-- to statuscolumn_for_buf (test seam) and fall back to vim.v.lnum at runtime.
+local function statuscolumn_at(child, source_lines, anns, lnum)
+  child.lua(string.format([[
+    local d = require("aside.display.aside")
+    local layout = require("aside.layout").get("greedy").solve(
+      %s, %d, { spill_direction = "below", wrap_width = 30, gutter_icon = "*" })
+    local buf = vim.api.nvim_create_buf(false, true)
+    d._test_set_data(424242, {
+      win = 424242, buf = buf, family = "f", source_path = "/x",
+      layout = layout, in_insert = false, deferred_render = false,
+      modified = false, augroup_name = "test_statuscol",
+    })
+    _G.test_buf = buf
+    _G.test_layout = layout
+  ]], anns, source_lines))
+  child.lua(string.format([[
+    _G.statuscol = require("aside.display.aside").statuscolumn_for_buf(_G.test_buf, %d)
+  ]], lnum))
+  local raw = child.lua_get("_G.statuscol")
+  -- strip "%#Group#" highlight prefixes for stable assertions
+  local glyphs = (raw or ""):gsub("%%#[^#]*#", "")
+  return glyphs
+end
+
+T["display.aside statuscolumn"]["single-line anchor uses single+single"] = function()
+  local anns = '{ { id="a1", family="f", file="/x", start_line=3, end_line=3, title="T", contents="", sort_key=nil, created_at=1 } }'
+  -- Row 3 is the only anchor row, also the only annotation row → both single.
+  -- For an annotation with no contents the title row IS the whole annotation.
+  -- box_position="single" (only one row) and anchor_position="single".
+  local g = statuscolumn_at(child, 10, anns, 3)
+  -- Outer column = anchor single = "│"; inner column = box single = "─".
+  eq(g, "\xe2\x94\x82\xe2\x94\x80") -- "│─"
+end
+
+T["display.aside statuscolumn"]["multi-row annotation: anchor outer, box inner"] = function()
+  -- start_line=1, end_line=6 → anchor spans aside rows 1..6.
+  -- contents is long enough to extend below the anchor.
+  local anns = [[{ {
+      id="a1", family="f", file="/x", start_line=1, end_line=6,
+      title="T", contents="c1\nc2\nc3\nc4\nc5\nc6\nc7\nc8\nc9\nc10",
+      sort_key=nil, created_at=1
+  } }]]
+
+  -- Row 1: anchor top, box top → outer="┐", inner="┌"
+  eq(statuscolumn_at(child, 20, anns, 1), "\xe2\x94\x90\xe2\x94\x8c") -- ┐┌
+  -- Row 6: anchor bottom, box middle → outer="┘", inner="│"
+  eq(statuscolumn_at(child, 20, anns, 6), "\xe2\x94\x98\xe2\x94\x82") -- ┘│
+  -- Row 7: past anchor (none), still inside box (middle) → outer=" ", inner="│"
+  eq(statuscolumn_at(child, 20, anns, 7), " \xe2\x94\x82")
+end
+
+T["display.aside statuscolumn"]["anchor middle uses plain vertical, not tee"] = function()
+  -- 6-line anchor, content long enough to make box larger than anchor.
+  -- Pick a row that is NOT the connector midpoint of the anchor (row 3 or 4),
+  -- so the anchor-middle glyph is the plain vertical "│" rather than the tee.
+  local anns = [[{ {
+      id="a1", family="f", file="/x", start_line=1, end_line=6,
+      title="T", contents="c1\nc2\nc3\nc4\nc5\nc6\nc7\nc8\nc9\nc10",
+      sort_key=nil, created_at=1
+  } }]]
+  -- Row 2 is anchor middle but not the midpoint connector → plain "│".
+  local g = statuscolumn_at(child, 20, anns, 2)
+  eq(g, "\xe2\x94\x82\xe2\x94\x82") -- "││"
+  -- Row 5 likewise: anchor middle, box middle, plain.
+  local g5 = statuscolumn_at(child, 20, anns, 5)
+  eq(g5, "\xe2\x94\x82\xe2\x94\x82")
+end
+
+T["display.aside statuscolumn"]["connector tee at midpoint of shorter box"] = function()
+  -- Source anchor span = 6, annotation span > 6, so anchor is the shorter
+  -- box. The connector "├┤" should land at the midpoint of the anchor
+  -- (row 3 for a 6-row anchor: floor((1+6)/2) = 3).
+  local anns = [[{ {
+      id="a1", family="f", file="/x", start_line=1, end_line=6,
+      title="T", contents="c1\nc2\nc3\nc4\nc5\nc6\nc7\nc8\nc9\nc10",
+      sort_key=nil, created_at=1
+  } }]]
+  local g = statuscolumn_at(child, 20, anns, 3)
+  eq(g, "\xe2\x94\x9c\xe2\x94\xa4") -- ├┤
+end
+
+T["display.aside statuscolumn"]["closer row: └ in gutter, dashes in text"] = function()
+  -- Multi-row annotation gets a synthetic closer row at the very bottom.
+  -- The closer row's statuscolumn shows " └" (no anchor + box-bottom).
+  -- Its text content is a run of horizontal box-drawing chars ("─...").
+  local anns = [[{ {
+      id="a1", family="f", file="/x", start_line=1, end_line=6,
+      title="T", contents="c1\nc2\nc3\nc4\nc5\nc6\nc7\nc8\nc9\nc10",
+      sort_key=nil, created_at=1
+  } }]]
+  child.lua(string.format([[
+    local layout = require("aside.layout").get("greedy").solve(
+      %s, 20, { spill_direction = "below", wrap_width = 30, gutter_icon = "*" })
+    local closer_idx
+    for i, r in ipairs(layout.rows) do
+      if r.row_kind == "closer" then closer_idx = i; break end
+    end
+    _G.closer_idx = closer_idx
+    if closer_idx then
+      _G.closer_row = layout.rows[closer_idx]
+      _G.prev_row = layout.rows[closer_idx - 1]
+    end
+  ]], anns))
+  -- A closer row must exist; box=bottom, anchor=none, text starts with "─".
+  eq(type(child.lua_get("_G.closer_idx")), "number")
+  eq(child.lua_get("_G.closer_row.row_kind"), "closer")
+  eq(child.lua_get("_G.closer_row.box_position"), "bottom")
+  eq(child.lua_get("_G.closer_row.anchor_position"), "none")
+  local text = child.lua_get("_G.closer_row.text")
+  eq(text:sub(1, #"\xe2\x94\x80"), "\xe2\x94\x80") -- "─"
+  -- The prior row (last content row) is now box=middle, not bottom.
+  eq(child.lua_get("_G.prev_row.box_position"), "middle")
+end
+
+T["display.aside statuscolumn"]["single-row annotation has no closer"] = function()
+  -- A single-line annotation (anchor=1 line, no contents overflow) should
+  -- NOT receive a closer row.
+  local anns = '{ { id="a1", family="f", file="/x", start_line=3, end_line=3, title="T", contents="", sort_key=nil, created_at=1 } }'
+  child.lua(string.format([[
+    local layout = require("aside.layout").get("greedy").solve(
+      %s, 10, { spill_direction = "below", wrap_width = 30, gutter_icon = "*" })
+    local has_closer = false
+    for _, r in ipairs(layout.rows) do
+      if r.row_kind == "closer" then has_closer = true end
+    end
+    _G.has_closer = has_closer
+  ]], anns))
+  eq(child.lua_get("_G.has_closer"), false)
+end
+
 return T

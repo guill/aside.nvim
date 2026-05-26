@@ -5,12 +5,12 @@
 ---@class Aside.Layout.Row
 ---@field source_line number which source visual row this aside row aligns to (1-indexed)
 ---@field ann_id string? annotation owning this row (nil for empty rows)
----@field row_kind "empty"|"title"|"content"|"spill" type of row
+---@field row_kind "empty"|"title"|"content"|"spill"|"closer" type of row
 ---@field segment_idx number? logical segment index within annotation (0=title, 1+=content lines)
 ---@field text string buffer text for this row (empty string for empty/spill rows)
 ---@field is_anchor boolean true if source_line is one of the annotation's real anchor lines
----@field box_position "top"|"middle"|"bottom"|"single"|"none" outer-column statuscolumn glyph
----@field anchor_position "top"|"middle"|"bottom"|"single"|"none" inner-column statuscolumn glyph
+---@field box_position "top"|"middle"|"bottom"|"single"|"connector"|"none" annotation-box statuscolumn glyph (inner column, adjacent to text)
+---@field anchor_position "top"|"middle"|"bottom"|"single"|"connector"|"none" source-anchor statuscolumn glyph (outer column, far from text)
 
 ---@class Aside.Layout.Result
 ---@field rows Aside.Layout.Row[] one entry per aside buffer line

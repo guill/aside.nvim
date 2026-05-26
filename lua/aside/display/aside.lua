@@ -252,7 +252,7 @@ function M.open(opts)
 
   vim.api.nvim_create_autocmd("WinScrolled", {
     group = group,
-    callback = function()
+    callback = function(args)
       if not vim.api.nvim_win_is_valid(source_win) then
         return
       end
@@ -260,8 +260,24 @@ function M.open(opts)
       if not aside_data or not vim.api.nvim_win_is_valid(aside_data.win) then
         return
       end
-      if M.sync_scroll then
-        M.sync_scroll(source_win)
+      -- WinScrolled fires once with vim.v.event populated by a dict of
+      -- {[winid_string] = {...}} for every window that scrolled. args.match
+      -- holds the most recently scrolled winid (as a string). Only react
+      -- when source_win or aside_win participated.
+      local matched = tonumber(args.match)
+      local scrolled_win
+      if matched == source_win or matched == aside_data.win then
+        scrolled_win = matched
+      else
+        local ev = vim.v.event or {}
+        if ev[tostring(source_win)] then
+          scrolled_win = source_win
+        elseif ev[tostring(aside_data.win)] then
+          scrolled_win = aside_data.win
+        end
+      end
+      if scrolled_win and M.sync_scroll then
+        M.sync_scroll(source_win, scrolled_win)
       end
     end,
   })
@@ -299,6 +315,11 @@ function M.open(opts)
   })
 
   M.render(source_win)
+  -- Initial scroll sync: if the source was already scrolled when open_aside
+  -- was invoked, the aside opens at topline=1 and won't catch up until the
+  -- user triggers another scroll. Force a one-shot sync so the panel lines
+  -- up with the visible source region immediately.
+  M.sync_scroll(source_win, source_win)
 end
 
 function M.close(win)
@@ -416,10 +437,12 @@ local _syncing = false
 
 --- Sync scroll position between a source window and its aside panel.
 --- Uses nvim_win_text_height to compute visual row offsets so wrapped lines,
---- folds, and virt_lines stay aligned. Bidirectional: detects which window
---- fired WinScrolled via vim.v.event.window and syncs the other.
+--- folds, and virt_lines stay aligned. Bidirectional: callers (typically the
+--- WinScrolled autocmd) pass the winid that just scrolled. When omitted, the
+--- source window is assumed to be the scroll origin.
 ---@param source_win integer
-function M.sync_scroll(source_win)
+---@param scrolled_win? integer winid of the window that scrolled
+function M.sync_scroll(source_win, scrolled_win)
   if _syncing then
     return
   end
@@ -435,14 +458,9 @@ function M.sync_scroll(source_win)
 
   _syncing = true
   pcall(function()
-    -- vim.v.event.window holds the window-id that scrolled (Neovim sets this
-    -- on WinScrolled). Fallback to source_win if event context is missing.
-    local scrolled_win = tonumber(vim.v.event and vim.v.event.window) or 0
-
     if scrolled_win == aside_data.win then
       M._sync_aside_to_source(source_win, aside_data)
     else
-      -- Default: source scrolled (covers scrolled_win == source_win and 0).
       M._sync_source_to_aside(source_win, aside_data)
     end
   end)
@@ -458,9 +476,7 @@ end
 function M._sync_source_to_aside(source_win, aside_data)
   local source_topline = vim.fn.line("w0", source_win)
   if source_topline <= 1 then
-    pcall(vim.api.nvim_win_call, aside_data.win, function()
-      vim.fn.winrestview({ topline = 1 })
-    end)
+    M._set_topline(aside_data.win, 1)
     return
   end
 
@@ -478,9 +494,7 @@ function M._sync_source_to_aside(source_win, aside_data)
   local aside_line_count = vim.api.nvim_buf_line_count(aside_data.buf)
   target_aside_row = math.max(1, math.min(target_aside_row, aside_line_count))
 
-  pcall(vim.api.nvim_win_call, aside_data.win, function()
-    vim.fn.winrestview({ topline = target_aside_row })
-  end)
+  M._set_topline(aside_data.win, target_aside_row)
 end
 
 --- Sync the source window's topline to match the aside panel's visual scroll
@@ -491,41 +505,65 @@ end
 function M._sync_aside_to_source(source_win, aside_data)
   local aside_topline = vim.fn.line("w0", aside_data.win)
   if aside_topline <= 1 then
-    pcall(vim.api.nvim_win_call, source_win, function()
-      vim.fn.winrestview({ topline = 1 })
-    end)
+    M._set_topline(source_win, 1)
     return
   end
 
-  -- Aside is 1:1, so target visual offset is aside_topline - 1.
+  -- Aside is 1:1 (wrap=false, no folds), so its visual_offset == aside_topline-1.
+  -- We need source_topline S such that visual_offset(source, S) == this value,
+  -- where visual_offset(buf, S) = text_height(start=0, end=S-2).all for S>=2
+  -- and 0 for S==1. This MUST be the inverse of _sync_source_to_aside or the
+  -- two sides drift on round-trips and ladder under feedback.
   local visual_rows_before = aside_topline - 1
 
   local source_buf = vim.api.nvim_win_get_buf(source_win)
   local source_line_count = vim.api.nvim_buf_line_count(source_buf)
 
-  -- Binary search for smallest 1-indexed buffer row `mid` such that visual
-  -- rows for [0, mid-1] >= visual_rows_before. That row becomes the new
-  -- topline.
-  local lo, hi = 1, source_line_count
-  while lo < hi do
-    local mid = math.floor((lo + hi) / 2)
+  -- Binary search for the largest S in [1, source_line_count] with
+  -- visual_offset(source, S) <= visual_rows_before. Picking the largest such
+  -- S (rather than the smallest S with offset >= target) keeps round-trips
+  -- stable when several source lines map to the same aside_topline (e.g. when
+  -- virt_lines sit between them).
+  local function visual_offset(S)
+    if S <= 1 then return 0 end
     local ok, result = pcall(vim.api.nvim_win_text_height, source_win, {
       start_row = 0,
-      end_row = mid - 1,
+      end_row = S - 2,
     })
-    local rows = (ok and result and result.all) or mid
-    if rows < visual_rows_before then
-      lo = mid + 1
+    if ok and result and result.all then return result.all end
+    return S - 1
+  end
+
+  local lo, hi = 1, source_line_count
+  while lo < hi do
+    -- Upper-mid bias: we are looking for the largest S that satisfies the
+    -- predicate, so round up to avoid getting stuck on lo.
+    local mid = math.floor((lo + hi + 1) / 2)
+    if visual_offset(mid) <= visual_rows_before then
+      lo = mid
     else
-      hi = mid
+      hi = mid - 1
     end
   end
 
-  local target_source_row = math.max(1, math.min(lo, source_line_count))
+  M._set_topline(source_win, lo)
+end
 
-  pcall(vim.api.nvim_win_call, source_win, function()
-    vim.fn.winrestview({ topline = target_source_row })
-  end)
+-- Persist a topline change on `win`. Both nvim_win_call and win_execute
+-- save+restore the cursor/view around the body they invoke, which silently
+-- undoes a winrestview() call. A normal-mode `<n>Gzt` motion mutates the
+-- cursor position itself, so the restored "view" coincides with the desired
+-- topline. This is the only Neovim primitive that reliably persists a
+-- programmatic scroll on a non-current window.
+---@param win integer
+---@param topline integer 1-indexed buffer row to make the window's top
+function M._set_topline(win, topline)
+  if not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+  local buf = vim.api.nvim_win_get_buf(win)
+  local n = math.max(1, math.min(topline, vim.api.nvim_buf_line_count(buf)))
+  pcall(vim.fn.win_execute, win, "keepjumps normal! " .. n .. "Gzt", true)
 end
 
 --- Apply source-side virt_lines padding for crowded annotations.
@@ -677,6 +715,13 @@ function M.render(source_win)
           hl_group = hl_groups.contents or "AsideContents",
         })
       end
+    elseif row.row_kind == "closer" then
+      if line_bytes > 0 then
+        pcall(vim.api.nvim_buf_set_extmark, aside_buf, hl_ns, line_idx, 0, {
+          end_col = line_bytes,
+          hl_group = hl_groups.border or "AsideBorder",
+        })
+      end
     end
   end
 
@@ -692,10 +737,14 @@ end
 
 --- Statuscolumn callback for the aside buffer.
 --- Called per-row with `vim.v.lnum` set (1-indexed). Returns the 2-column
---- glyph string composed of the outer box glyph and inner anchor glyph.
+--- glyph string. The OUTER (left, far from text) column tracks the source
+--- ANCHOR span; the INNER (right, adjacent to text) column tracks the full
+--- ANNOTATION box. The `lnum` parameter is a test seam — when omitted the
+--- live `vim.v.lnum` is used (the only path Neovim itself invokes).
 ---@param buf integer Aside buffer handle
+---@param lnum? integer 1-indexed row number; defaults to vim.v.lnum
 ---@return string statuscolumn content
-function M.statuscolumn_for_buf(buf)
+function M.statuscolumn_for_buf(buf, lnum)
   local aside_data = nil
   for _, data in pairs(aside_windows) do
     if data.buf == buf then
@@ -707,27 +756,31 @@ function M.statuscolumn_for_buf(buf)
     return "  "
   end
 
-  local lnum = vim.v.lnum -- 1-indexed
+  lnum = lnum or vim.v.lnum
   local row = aside_data.layout.rows[lnum]
   if not row then
     return "  "
   end
 
+  -- Outer (left) column: anchor position glyphs.
   local outer_glyph = ({
-    top = "\226\148\140",     -- ┌
-    middle = "\226\148\130",  -- │
-    bottom = "\226\148\148",  -- └
-    single = "\226\148\128",  -- ─
-    none = " ",
-  })[row.box_position] or " "
-
-  local inner_glyph = ({
-    top = "\226\148\144",     -- ┐
-    middle = "\226\148\156",  -- ├
-    bottom = "\226\148\152",  -- ┘
-    single = "\226\148\164",  -- ┤
+    top = "\226\148\144",        -- ┐
+    middle = "\226\148\130",     -- │
+    bottom = "\226\148\152",     -- ┘
+    single = "\226\148\130",     -- │
+    connector = "\226\148\156",  -- ├
     none = " ",
   })[row.anchor_position] or " "
+
+  -- Inner (right) column: annotation-box position glyphs.
+  local inner_glyph = ({
+    top = "\226\148\140",        -- ┌
+    middle = "\226\148\130",     -- │
+    bottom = "\226\148\148",     -- └
+    single = "\226\148\128",     -- ─
+    connector = "\226\148\164",  -- ┤
+    none = " ",
+  })[row.box_position] or " "
 
   return "%#AsideBorder#" .. outer_glyph .. inner_glyph
 end

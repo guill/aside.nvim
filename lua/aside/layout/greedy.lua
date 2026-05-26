@@ -213,6 +213,28 @@ function M.solve(annotations, source_line_count, options)
       remaining = 0
     end
 
+    -- 4. Synthetic closer row: append ONE extra virt row at the source line
+    -- of the annotation's last occupied row, so the closer glyph "└" lands
+    -- visually below the entire box. Only emitted for multi-row annotations.
+    if #rows_for_ann >= 2 then
+      local last_row = rows_for_ann[#rows_for_ann]
+      local closer_source = last_row.source_line
+      local existing = virt_count_by_line[closer_source] or 0
+      virt_count_by_line[closer_source] = existing + 1
+      local list = virt_alloc[closer_source]
+      if list == nil then
+        list = {}
+        virt_alloc[closer_source] = list
+      end
+      table.insert(list, { ann_id = ann.id, count = 1, is_closer = true })
+      table.insert(rows_for_ann, {
+        kind = "virt",
+        source_line = closer_source,
+        virt_idx = existing + 1,
+        is_closer = true,
+      })
+    end
+
     ann_rows[ann.id] = rows_for_ann
   end
 
@@ -244,8 +266,16 @@ function M.solve(annotations, source_line_count, options)
 
     local content = {}
     local seg_idx = 1
-    for i, _ in ipairs(rows) do
-      if i == title_visual_idx and title_text ~= nil then
+    -- Render the closer text as a row of horizontal box-drawing chars so the
+    -- "└" in the gutter visually continues into the buffer area. Width is a
+    -- fixed visual length (not the buffer width) to avoid recomputing on
+    -- window resize; the buffer text intentionally falls short of the wrap
+    -- width so the closer doesn't bleed past trailing content.
+    local closer_text = string.rep("\xe2\x94\x80", 13)
+    for i, row in ipairs(rows) do
+      if row.is_closer then
+        content[i] = { row_kind = "closer", segment_idx = nil, text = closer_text }
+      elseif i == title_visual_idx and title_text ~= nil then
         content[i] = { row_kind = "title", segment_idx = 0, text = title_text }
       elseif seg_idx <= #segments then
         local seg = segments[seg_idx]
@@ -259,20 +289,52 @@ function M.solve(annotations, source_line_count, options)
   end
 
   -- Per-annotation totals for box/anchor position glyph computation.
+  -- connector_idx: aside row receiving the "├┤" connector accent, placed at
+  -- the midpoint of the SHORTER of (anchor span, full annotation box span).
+  -- The connector visually ties the two stacks together; only emitted when
+  -- both boxes are tall enough to have a true middle row (span >= 3) and
+  -- both stacks differ in span (otherwise the boxes coincide perfectly).
   local ann_meta = {}
   for _, ann in ipairs(sorted) do
     local rows = ann_rows[ann.id]
     local first_anchor_idx, last_anchor_idx
+    local closer_idx
     for i, row in ipairs(rows) do
       if row.is_anchor then
         if first_anchor_idx == nil then first_anchor_idx = i end
         last_anchor_idx = i
       end
+      if row.is_closer then closer_idx = i end
     end
+    local total = #rows
+    local content_total = closer_idx and (total - 1) or total
+    local anchor_span
+    if first_anchor_idx and last_anchor_idx then
+      anchor_span = last_anchor_idx - first_anchor_idx + 1
+    else
+      anchor_span = 0
+    end
+
+    -- Connector is the midpoint of the shorter of (anchor span, content box
+    -- span). The closer row is excluded from "box span" so the connector
+    -- placement is unaffected by the trailing decoration.
+    local connector_idx
+    if anchor_span >= 3 and content_total >= 3 and anchor_span ~= content_total then
+      if anchor_span <= content_total then
+        connector_idx = first_anchor_idx
+          + math.floor((anchor_span - 1) / 2)
+      else
+        connector_idx = 1 + math.floor((content_total - 1) / 2)
+      end
+    end
+
     ann_meta[ann.id] = {
-      total_rows = #rows,
+      total_rows = total,
+      content_total = content_total,
       first_anchor_idx = first_anchor_idx,
       last_anchor_idx = last_anchor_idx,
+      closer_idx = closer_idx,
+      connector_idx = connector_idx,
     }
   end
 
@@ -304,6 +366,12 @@ function M.solve(annotations, source_line_count, options)
         anchor = "middle"
       end
     end
+
+    if meta.connector_idx and visual_idx == meta.connector_idx then
+      if anchor == "middle" then anchor = "connector" end
+      if box == "middle" then box = "connector" end
+    end
+
     return box, anchor
   end
 
