@@ -726,6 +726,19 @@ function M.render(source_win)
 
   -- Buffer stays editable (no modifiable = false here).
   vim.bo[aside_buf].modifiable = true
+
+  -- nvim_buf_set_lines marks the buffer 'modified' and fires TextChanged on
+  -- the next event tick, both flagging this programmatic render as a user
+  -- edit. Clear Vim's flag immediately and clear our own flag on the next
+  -- tick (after TextChanged has run) so :close / set_family don't refuse.
+  vim.bo[aside_buf].modified = false
+  aside_data.modified = false
+  vim.schedule(function()
+    if aside_windows[source_win] and vim.api.nvim_buf_is_valid(aside_buf) then
+      vim.bo[aside_buf].modified = false
+      aside_data.modified = false
+    end
+  end)
 end
 
 --- Statuscolumn callback for the aside buffer.

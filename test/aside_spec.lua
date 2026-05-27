@@ -1359,6 +1359,19 @@ local function setup_long_source_with_aside(child)
   ]])
 end
 
+T["display.aside scroll sync"]["aside buffer is clean immediately after open"] = function()
+  setup_long_source_with_aside(child)
+  child.lua([[
+    _G.bo_modified = vim.bo[_G.aside_buf].modified
+    _G.our_modified = _G.aside_data.modified
+  ]])
+  -- Both Vim's 'modified' flag and our own dirty flag must be false right
+  -- after open_aside renders the initial layout. Otherwise the user can't
+  -- :close or switch families without :q! / :e!.
+  eq(child.lua_get("_G.bo_modified"), false)
+  eq(child.lua_get("_G.our_modified"), false)
+end
+
 T["display.aside scroll sync"]["source scroll moves aside (baseline)"] = function()
   setup_long_source_with_aside(child)
   child.lua([[
