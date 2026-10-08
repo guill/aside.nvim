@@ -1,451 +1,170 @@
 local M = {}
 
--- Split a single logical line (no newlines inside) into chunks of at most
--- `width` bytes, preferring to break at whitespace. Byte-level for now;
--- multi-byte UTF-8 may yield slightly off widths but does not corrupt text.
-local function wrap_text(text, width)
-  if width <= 0 or #text <= width then
-    return { text }
-  end
-  local result = {}
-  local pos = 1
-  while pos <= #text do
-    local chunk = text:sub(pos, pos + width - 1)
-    local last_space = chunk:reverse():find("%s")
-    if last_space and pos + width <= #text then
-      chunk = chunk:sub(1, #chunk - last_space)
-    end
-    table.insert(result, chunk)
-    pos = pos + #chunk
-    while text:sub(pos, pos):match("%s") do
-      pos = pos + 1
-    end
-  end
-  if #result == 0 then
-    result = { "" }
-  end
-  return result
+local CLOSER_TEXT = string.rep("\226\148\128", 13) -- "─" x 13
+
+local function width_of(s)
+  return vim.fn.strdisplaywidth(s)
 end
 
--- Take an annotation's full `contents` string (may have \n separators) and
--- return an ordered list of wrapped chunks ready for placement.
-local function wrap_content(text, width)
-  local logical = vim.split(text, "\n", { plain = true })
-  local result = {}
-  for _, line in ipairs(logical) do
-    if line == "" then
-      table.insert(result, "")
+--- Split one logical line into chunks of display width <= `width`, breaking
+--- at whitespace when possible and on character (not byte) boundaries.
+--- Each chunk records `sep`, the whitespace dropped before it, so joining
+--- `chunk[1].text .. chunk[2].sep .. chunk[2].text ..` restores `text`.
+---@param text string
+---@param width integer
+---@return {text: string, sep: string?}[]
+function M.wrap(text, width)
+  local chunks, sep, rest = {}, nil, text
+  while width >= 1 and width_of(rest) > width do
+    local lo, hi = 1, vim.fn.strchars(rest)
+    while lo < hi do
+      local mid = math.floor((lo + hi + 1) / 2)
+      if width_of(vim.fn.strcharpart(rest, 0, mid)) <= width then lo = mid else hi = mid - 1 end
+    end
+    local head = vim.fn.strcharpart(rest, 0, lo)
+    local after = rest:sub(#head + 1)
+    local cut_sep
+    if after:match("^%s") then
+      cut_sep = after:match("^%s+")
     else
-      local chunks = wrap_text(line, width)
-      for _, c in ipairs(chunks) do
-        table.insert(result, c)
+      local s = head:find("%s+%S*$")
+      if s and s > 1 then
+        cut_sep = head:sub(s):match("^%s+")
+        head = head:sub(1, s - 1)
+      else
+        cut_sep = ""
       end
     end
+    rest = rest:sub(#head + #cut_sep + 1)
+    if rest == "" then
+      table.insert(chunks, { text = head .. cut_sep, sep = sep })
+      return chunks
+    end
+    table.insert(chunks, { text = head, sep = sep })
+    sep = cut_sep
   end
-  return result
+  table.insert(chunks, { text = rest, sep = sep })
+  return chunks
 end
 
--- DESIGN.md ordering:
--- 1) sort_key (ann with sort_key wins; ascending among themselves)
--- 2) end_line ascending
--- 3) start_line ascending
--- 4) family alphabetical
--- 5) created_at ascending
+-- DESIGN.md ordering for annotations stacked on the same line.
 local function compare_annotations(a, b)
   if a.sort_key ~= nil and b.sort_key ~= nil then
-    if a.sort_key ~= b.sort_key then
-      return a.sort_key < b.sort_key
-    end
+    if a.sort_key ~= b.sort_key then return a.sort_key < b.sort_key end
   elseif a.sort_key ~= nil then
     return true
   elseif b.sort_key ~= nil then
     return false
   end
-  if a.end_line ~= b.end_line then
-    return a.end_line < b.end_line
-  end
-  if a.start_line ~= b.start_line then
-    return a.start_line < b.start_line
-  end
-  local af = a.family or ""
-  local bf = b.family or ""
-  if af ~= bf then
-    return af < bf
-  end
-  local ac = a.created_at or 0
-  local bc = b.created_at or 0
-  return ac < bc
+  if a.end_line ~= b.end_line then return a.end_line < b.end_line end
+  if a.start_line ~= b.start_line then return a.start_line < b.start_line end
+  if (a.family or "") ~= (b.family or "") then return (a.family or "") < (b.family or "") end
+  return (a.created_at or 0) < (b.created_at or 0)
 end
 
-local function sort_annotations(annotations)
-  local sorted = {}
-  for _, a in ipairs(annotations) do
-    table.insert(sorted, a)
-  end
-  table.sort(sorted, compare_annotations)
-  return sorted
-end
-
--- How many visual rows the annotation would like to occupy after wrapping.
--- Always at least the anchor span (we cannot collapse rows belonging to the
--- source anchor range).
-local function compute_rendered_rows(ann, wrap_width)
-  local rendered = 0
+-- Text rows of one annotation in reading order: title, then contents.
+local function text_rows(ann, width, icon)
+  local rows = {}
   if ann.title and ann.title ~= "" then
-    rendered = rendered + 1
+    local prefix = icon .. " "
+    for i, c in ipairs(M.wrap(ann.title, width - width_of(prefix))) do
+      table.insert(rows, { row_kind = "title", segment_idx = 0, text = (i == 1 and prefix or "") .. c.text, sep = c.sep })
+    end
   end
   if ann.contents and ann.contents ~= "" then
-    local chunks = wrap_content(ann.contents, wrap_width)
-    rendered = rendered + #chunks
+    for seg, line in ipairs(vim.split(ann.contents, "\n", { plain = true })) do
+      for _, c in ipairs(M.wrap(line, width)) do
+        table.insert(rows, { row_kind = "content", segment_idx = seg, text = c.text, sep = c.sep })
+      end
+    end
   end
-  if rendered == 0 then
-    rendered = 1
-  end
-  local anchor_span = ann.end_line - ann.start_line + 1
-  if anchor_span < 1 then anchor_span = 1 end
-  return math.max(anchor_span, rendered)
+  return rows
 end
 
+--- Lay annotations out as aside rows grouped into one block per source line.
+--- An annotation's rows are contiguous and start at the block of its
+--- start_line when that block is free. Rows continue into following free
+--- blocks up to the next annotation's start line; anything beyond becomes
+--- extra rows inside the last block (the source gets padding for those).
+--- When the room below is short, the box starts higher (spills above).
 ---@param annotations Aside.Annotation[]
 ---@param source_line_count number
 ---@param options Aside.Layout.SolverOptions
 ---@return Aside.Layout.Result
 function M.solve(annotations, source_line_count, options)
   options = options or {}
-  local spill_direction = options.spill_direction or "below"
-  local wrap_width = options.wrap_width or 30
-  local gutter_icon = options.gutter_icon or "●"
+  local n_lines = math.max(1, source_line_count)
+  local width = options.wrap_width or 30
+  local icon = options.gutter_icon or "\226\151\143"
+  local above = options.spill_direction == "above"
 
-  local sorted = sort_annotations(annotations)
-
-  -- Reserve every annotation's anchor lines up-front so that earlier-sorted
-  -- annotations cannot spill into a later annotation's anchor range.
-  local anchor_reserved = {}
-  for _, ann in ipairs(sorted) do
-    local s = math.max(1, ann.start_line)
-    local e = math.min(source_line_count, ann.end_line)
-    for line = s, e do
-      anchor_reserved[line] = true
-    end
+  local anns = {}
+  for _, a in ipairs(annotations) do
+    local s = math.min(math.max(1, a.start_line), n_lines)
+    local e = math.min(math.max(s, a.end_line or s), n_lines)
+    table.insert(anns, setmetatable({ s = s, e = e }, { __index = a }))
   end
+  table.sort(anns, function(a, b)
+    if a.s ~= b.s then return a.s < b.s end
+    return compare_annotations(a, b)
+  end)
 
-  local source_owner = {}                  -- source_line -> ann_id
-  local virt_alloc = {}                    -- source_line -> { {ann_id, count}, ... }
-  local virt_count_by_line = {}            -- source_line -> total virt rows
-  local ann_rows = {}                      -- ann_id -> ordered list of visual rows
+  local blocks = {} -- source_line -> rows placed in that block
+  for line = 1, n_lines do blocks[line] = {} end
+  local last_used = 0
+  local meta = {}
 
-  for _, ann in ipairs(sorted) do
-    local required = compute_rendered_rows(ann, wrap_width)
-    local anchor_span = ann.end_line - ann.start_line + 1
-    if anchor_span < 1 then anchor_span = 1 end
-    local extra = required - anchor_span
-
-    local rows_for_ann = {}
-
-    -- 1. Anchor rows (always claimed)
-    for line = ann.start_line, ann.end_line do
-      if line >= 1 and line <= source_line_count then
-        source_owner[line] = ann.id
-        table.insert(rows_for_ann, { kind = "source", source_line = line, is_anchor = true })
-      end
+  for i, a in ipairs(anns) do
+    local limit = n_lines
+    for j = i + 1, #anns do
+      if anns[j].s > a.s then limit = anns[j].s - 1 break end
     end
 
-    local remaining = extra
+    local rows = text_rows(a, width, icon)
+    local want = math.max(#rows, 1, math.min(a.e, limit) - a.s + 1)
+    while #rows < want do table.insert(rows, { row_kind = "spill", text = "" }) end
+    local n = #rows
 
-    local function try_spill_below()
-      local line = ann.end_line + 1
-      while remaining > 0 and line <= source_line_count do
-        if source_owner[line] == nil and not anchor_reserved[line] then
-          source_owner[line] = ann.id
-          table.insert(rows_for_ann, { kind = "source", source_line = line, is_anchor = false })
-          remaining = remaining - 1
-          line = line + 1
-        else
-          break
-        end
-      end
-    end
-
-    local function try_spill_above()
-      local line = ann.start_line - 1
-      while remaining > 0 and line >= 1 do
-        if source_owner[line] == nil and not anchor_reserved[line] then
-          source_owner[line] = ann.id
-          table.insert(rows_for_ann, 1, { kind = "source", source_line = line, is_anchor = false })
-          remaining = remaining - 1
-          line = line - 1
-        else
-          break
-        end
-      end
-    end
-
-    if remaining > 0 then
-      if spill_direction == "above" then
-        try_spill_above()
-        if remaining > 0 then try_spill_below() end
-      else
-        try_spill_below()
-        if remaining > 0 then try_spill_above() end
-      end
-    end
-
-    -- 3. Virt_lines fallback for whatever is still missing
-    if remaining > 0 then
-      local anchor_target = ann.end_line
-      if anchor_target < 1 then anchor_target = 1 end
-      if anchor_target > source_line_count then anchor_target = source_line_count end
-      local existing = virt_count_by_line[anchor_target] or 0
-      virt_count_by_line[anchor_target] = existing + remaining
-      local list = virt_alloc[anchor_target]
-      if list == nil then
-        list = {}
-        virt_alloc[anchor_target] = list
-      end
-      table.insert(list, { ann_id = ann.id, count = remaining })
-      for i = 1, remaining do
-        table.insert(rows_for_ann, {
-          kind = "virt",
-          source_line = anchor_target,
-          virt_idx = existing + i,
-        })
-      end
-      remaining = 0
-    end
-
-    -- 4. Synthetic closer row: append ONE extra virt row at the source line
-    -- of the annotation's last occupied row, so the closer glyph "└" lands
-    -- visually below the entire box. Only emitted for multi-row annotations.
-    if #rows_for_ann >= 2 then
-      local last_row = rows_for_ann[#rows_for_ann]
-      local closer_source = last_row.source_line
-      local existing = virt_count_by_line[closer_source] or 0
-      virt_count_by_line[closer_source] = existing + 1
-      local list = virt_alloc[closer_source]
-      if list == nil then
-        list = {}
-        virt_alloc[closer_source] = list
-      end
-      table.insert(list, { ann_id = ann.id, count = 1, is_closer = true })
-      table.insert(rows_for_ann, {
-        kind = "virt",
-        source_line = closer_source,
-        virt_idx = existing + 1,
-        is_closer = true,
-      })
-    end
-
-    ann_rows[ann.id] = rows_for_ann
-  end
-
-  -- Decide per-row text/segment for every annotation. Title sits on the row
-  -- aligned to ann.start_line; remaining rows take content segments in
-  -- visual order; leftover rows become spill.
-  local ann_row_content = {}
-  for _, ann in ipairs(sorted) do
-    local rows = ann_rows[ann.id]
-    local title_text = nil
-    if ann.title and ann.title ~= "" then
-      title_text = gutter_icon .. " " .. ann.title
-    end
-    local segments = {}
-    if ann.contents and ann.contents ~= "" then
-      local chunks = wrap_content(ann.contents, wrap_width)
-      for i, c in ipairs(chunks) do
-        table.insert(segments, { text = c, segment_idx = i })
-      end
-    end
-
-    local title_visual_idx = nil
-    for i, row in ipairs(rows) do
-      if row.kind == "source" and row.source_line == ann.start_line then
-        title_visual_idx = i
-        break
-      end
-    end
-
-    local content = {}
-    local seg_idx = 1
-    -- Render the closer text as a row of horizontal box-drawing chars so the
-    -- "└" in the gutter visually continues into the buffer area. Width is a
-    -- fixed visual length (not the buffer width) to avoid recomputing on
-    -- window resize; the buffer text intentionally falls short of the wrap
-    -- width so the closer doesn't bleed past trailing content.
-    local closer_text = string.rep("\xe2\x94\x80", 13)
-    for i, row in ipairs(rows) do
-      if row.is_closer then
-        content[i] = { row_kind = "closer", segment_idx = nil, text = closer_text }
-      elseif i == title_visual_idx and title_text ~= nil then
-        content[i] = { row_kind = "title", segment_idx = 0, text = title_text }
-      elseif seg_idx <= #segments then
-        local seg = segments[seg_idx]
-        content[i] = { row_kind = "content", segment_idx = seg.segment_idx, text = seg.text }
-        seg_idx = seg_idx + 1
-      else
-        content[i] = { row_kind = "spill", segment_idx = nil, text = "" }
-      end
-    end
-    ann_row_content[ann.id] = content
-  end
-
-  -- Per-annotation totals for box/anchor position glyph computation.
-  -- connector_idx: aside row receiving the "├┤" connector accent, placed at
-  -- the midpoint of the SHORTER of (anchor span, full annotation box span).
-  -- The connector visually ties the two stacks together; only emitted when
-  -- both boxes are tall enough to have a true middle row (span >= 3) and
-  -- both stacks differ in span (otherwise the boxes coincide perfectly).
-  local ann_meta = {}
-  for _, ann in ipairs(sorted) do
-    local rows = ann_rows[ann.id]
-    local first_anchor_idx, last_anchor_idx
-    local closer_idx
-    for i, row in ipairs(rows) do
-      if row.is_anchor then
-        if first_anchor_idx == nil then first_anchor_idx = i end
-        last_anchor_idx = i
-      end
-      if row.is_closer then closer_idx = i end
-    end
-    local total = #rows
-    local content_total = closer_idx and (total - 1) or total
-    local anchor_span
-    if first_anchor_idx and last_anchor_idx then
-      anchor_span = last_anchor_idx - first_anchor_idx + 1
+    local first_free = last_used + 1
+    local line
+    if a.s < first_free then
+      line = last_used -- start block already taken: continue as extra rows
+    elseif above then
+      line = math.max(first_free, math.min(a.s, math.min(a.e, limit) - n + 1))
+    elseif n <= limit - a.s + 1 then
+      line = a.s
     else
-      anchor_span = 0
+      line = math.max(first_free, math.min(a.s, limit - n + 1))
     end
 
-    -- Connector is the midpoint of the shorter of (anchor span, content box
-    -- span). The closer row is excluded from "box span" so the connector
-    -- placement is unaffected by the trailing decoration.
-    local connector_idx
-    if anchor_span >= 3 and content_total >= 3 and anchor_span ~= content_total then
-      if anchor_span <= content_total then
-        connector_idx = first_anchor_idx
-          + math.floor((anchor_span - 1) / 2)
-      else
-        connector_idx = 1 + math.floor((content_total - 1) / 2)
-      end
+    for k, row in ipairs(rows) do
+      row.ann_id = a.id
+      table.insert(blocks[line], row)
+      if k < n and line + 1 <= limit and #blocks[line + 1] == 0 then line = line + 1 end
     end
-
-    ann_meta[ann.id] = {
-      total_rows = total,
-      content_total = content_total,
-      first_anchor_idx = first_anchor_idx,
-      last_anchor_idx = last_anchor_idx,
-      closer_idx = closer_idx,
-      connector_idx = connector_idx,
-    }
+    if n >= 2 then
+      table.insert(blocks[line], { ann_id = a.id, row_kind = "closer", text = CLOSER_TEXT })
+    end
+    last_used = math.max(last_used, line)
+    table.insert(meta, { id = a.id, start_line = a.s, end_line = a.e })
   end
 
-  local function position_for(ann_id, visual_idx, is_anchor)
-    local meta = ann_meta[ann_id]
-    local total = meta.total_rows
-    local box
-    if total == 1 then
-      box = "single"
-    elseif visual_idx == 1 then
-      box = "top"
-    elseif visual_idx == total then
-      box = "bottom"
-    else
-      box = "middle"
+  local result, extra = {}, {}
+  for line = 1, n_lines do
+    local list = blocks[line]
+    if #list == 0 then
+      list = { { row_kind = "empty", text = "" } }
+    elseif #list > 1 then
+      extra[line] = #list - 1
     end
-
-    local anchor
-    if not is_anchor then
-      anchor = "none"
-    else
-      if meta.first_anchor_idx == meta.last_anchor_idx then
-        anchor = "single"
-      elseif visual_idx == meta.first_anchor_idx then
-        anchor = "top"
-      elseif visual_idx == meta.last_anchor_idx then
-        anchor = "bottom"
-      else
-        anchor = "middle"
-      end
-    end
-
-    if meta.connector_idx and visual_idx == meta.connector_idx then
-      if anchor == "middle" then anchor = "connector" end
-      if box == "middle" then box = "connector" end
-    end
-
-    return box, anchor
-  end
-
-  -- Index ann_rows for quick lookup when emitting.
-  local ann_row_index = {}
-  for ann_id, rows in pairs(ann_rows) do
-    local map = {}
-    for i, row in ipairs(rows) do
-      if row.kind == "source" then
-        map["s:" .. row.source_line] = i
-      else
-        map["v:" .. row.source_line .. ":" .. row.virt_idx] = i
-      end
-    end
-    ann_row_index[ann_id] = map
-  end
-
-  local result_rows = {}
-
-  local function emit_empty(source_line)
-    table.insert(result_rows, {
-      source_line = source_line,
-      ann_id = nil,
-      row_kind = "empty",
-      segment_idx = nil,
-      text = "",
-      is_anchor = false,
-      box_position = "none",
-      anchor_position = "none",
-    })
-  end
-
-  local function emit_ann_row(ann_id, source_line, visual_idx, is_anchor)
-    local content = ann_row_content[ann_id][visual_idx]
-    local box, anchor = position_for(ann_id, visual_idx, is_anchor)
-    table.insert(result_rows, {
-      source_line = source_line,
-      ann_id = ann_id,
-      row_kind = content.row_kind,
-      segment_idx = content.segment_idx,
-      text = content.text,
-      is_anchor = is_anchor,
-      box_position = box,
-      anchor_position = anchor,
-    })
-  end
-
-  for source_line = 1, source_line_count do
-    local owner = source_owner[source_line]
-    if owner then
-      local visual_idx = ann_row_index[owner]["s:" .. source_line]
-      local row_data = ann_rows[owner][visual_idx]
-      emit_ann_row(owner, source_line, visual_idx, row_data.is_anchor)
-    else
-      emit_empty(source_line)
-    end
-
-    local list = virt_alloc[source_line]
-    if list then
-      local consumed = 0
-      for _, alloc in ipairs(list) do
-        for _ = 1, alloc.count do
-          consumed = consumed + 1
-          local visual_idx = ann_row_index[alloc.ann_id]["v:" .. source_line .. ":" .. consumed]
-          emit_ann_row(alloc.ann_id, source_line, visual_idx, false)
-        end
-      end
+    for _, row in ipairs(list) do
+      row.source_line = line
+      table.insert(result, row)
     end
   end
 
-  return {
-    rows = result_rows,
-    virt_lines_by_source_line = virt_count_by_line,
-  }
+  require("aside.layout").decorate(result, meta)
+  return { rows = result, virt_lines_by_source_line = extra, annotations = meta }
 end
 
 require("aside.layout").register("greedy", M)

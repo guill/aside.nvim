@@ -30,6 +30,7 @@ function M.attach_extmark(annotation)
     annotation.extmark_id = extmark_id
     annotation.extmark_buf = buf
     extmark_to_annotation[buf .. ":" .. extmark_id] = annotation.id
+    M.setup_buffer_tracking(buf)
     return extmark_id
   end
   return nil

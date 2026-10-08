@@ -17,6 +17,13 @@ vim.api.nvim_create_user_command("AsideAdd", function(opts)
   end
   
   local file = vim.api.nvim_buf_get_name(0)
+  -- From inside an aside panel, annotate the source lines the rows sit beside.
+  local panel = require("aside.display.aside")
+  local source_file, source_start = panel.map_to_source(vim.api.nvim_get_current_buf(), start_line)
+  if source_file then
+    local _, source_end = panel.map_to_source(vim.api.nvim_get_current_buf(), end_line)
+    file, start_line, end_line = source_file, source_start, source_end
+  end
   if file == "" then
     vim.notify("Buffer must be saved to a file first", vim.log.levels.ERROR)
     return

@@ -1,286 +1,187 @@
----@diagnostic disable: undefined-global
---- Extmark role manager for the aside buffer's edit-region tracking.
---- Manages three extmark roles per annotation:
----   - seg_start:  first buffer line of a segment (title or content)
----   - wrap_cont:  continuation line of a wrapped segment (same ann_id + segment_idx as prev)
----   - ann_end:    one-past-last row of an annotation (right_gravity=true)
+--- Row identity tracking for the aside buffer.
 ---
---- This module owns no rendering — it only places and queries metadata extmarks.
+--- `place()` puts one mark on every annotation row (namespace
+--- aside_edit_regions) and one on every row recording its source line's
+--- block (namespace aside_blocks). Marks use `invalidate`, so a deleted row's
+--- mark disappears while edits inside a row keep it. `read()` turns the
+--- edited buffer back into rows: a row is identified by its leftmost valid
+--- mark (`J` moves the joined row's mark to a later column), and rows the
+--- user inserted inherit the annotation and block of the row above them.
+---
+--- Blocks follow source edits: `place()` also marks each block's line in the
+--- source buffer, and `read()` reports where that mark is now. A deleted
+--- source line's mark falls to the next line, so its rows join that block.
 
-local nvim = _G.vim
 local M = {}
 
-local ns_id = nvim.api.nvim_create_namespace("aside_edit_regions")
+local ns_id = vim.api.nvim_create_namespace("aside_edit_regions")
+local block_ns = vim.api.nvim_create_namespace("aside_blocks")
 
---- Module-local registry: buf -> { extmark_id -> { ann_id, role, segment_idx? } }
----@type table<integer, table<integer, {ann_id: string, role: string, segment_idx: number?}>>
-local regions_by_buf = {}
+---@type table<integer, {rows: table<integer, table>, blocks: table<integer, integer>, ann_ids: string[]}>
+local registry = {}
 
 local function buf_is_valid(buf)
-  local ok, valid = pcall(nvim.api.nvim_buf_is_valid, buf)
+  local ok, valid = pcall(vim.api.nvim_buf_is_valid, buf)
   return ok and valid
 end
 
---- Get the registered namespace (exposed for tests / introspection).
 function M.get_namespace_id()
   return ns_id
 end
 
---- Clear all aside_edit_regions extmarks and per-buffer state.
+-- Namespace of the source-line marks owned by aside buffer `buf`.
+local function source_ns(buf)
+  return vim.api.nvim_create_namespace("aside_source_lines_" .. buf)
+end
+
 ---@param buf integer
 function M.clear(buf)
-  regions_by_buf[buf] = nil
-  if not buf_is_valid(buf) then
-    return
+  local reg = registry[buf]
+  if reg and buf_is_valid(reg.source_buf) then
+    pcall(vim.api.nvim_buf_clear_namespace, reg.source_buf, source_ns(buf), 0, -1)
   end
-  pcall(nvim.api.nvim_buf_clear_namespace, buf, ns_id, 0, -1)
+  registry[buf] = nil
+  if buf_is_valid(buf) then
+    pcall(vim.api.nvim_buf_clear_namespace, buf, ns_id, 0, -1)
+    pcall(vim.api.nvim_buf_clear_namespace, buf, block_ns, 0, -1)
+  end
 end
 
---- Internal: place a single extmark and record it in the registry.
-local function place_mark(buf, line, opts, ann_id, role, segment_idx)
-  local ok, id = pcall(nvim.api.nvim_buf_set_extmark, buf, ns_id, line, 0, opts)
-  if ok and type(id) == "number" then
-    regions_by_buf[buf][id] = {
-      ann_id = ann_id,
-      role = role,
-      segment_idx = segment_idx,
-    }
-    return id
-  end
-  return nil
-end
-
---- Place extmarks for every annotation present in `layout`.
---- Replaces any existing aside_edit_regions extmarks on `buf`.
+--- Mark the rows of a freshly rendered buffer. `layout.rows` closer rows are
+--- not buffer lines and are skipped.
 ---@param buf integer
 ---@param layout Aside.Layout.Result
-function M.place(buf, layout)
+---@param source_buf? integer Source buffer whose edits blocks should follow
+function M.place(buf, layout, source_buf)
   M.clear(buf)
   if not buf_is_valid(buf) then
     return
   end
-  regions_by_buf[buf] = {}
-
-  if not layout or type(layout.rows) ~= "table" then
-    return
+  local reg = { rows = {}, blocks = {}, ann_ids = {}, line_marks = {} }
+  if buf_is_valid(source_buf) then
+    reg.source_buf = source_buf
   end
-
-  local rows = layout.rows
-  local n = #rows
-  if n == 0 then
-    return
-  end
-
-  local ok_count, buf_line_count = pcall(nvim.api.nvim_buf_line_count, buf)
-  if not ok_count then
-    return
-  end
-
-  local prev_ann_id = nil
-  local prev_segment_idx = nil
-  local ann_order = {}
-  local ann_seen = {}
-  local ann_last_row = {} -- ann_id -> 1-indexed row position of the last row belonging to that annotation
-
-  for i, row in ipairs(rows) do
-    local kind = row.row_kind
-    local ann_id = row.ann_id
-
-    if (kind == "title" or kind == "content") and ann_id ~= nil then
-      local segment_idx = row.segment_idx
-      local buf_line = i - 1 -- 0-indexed buffer row
-
-      if not ann_seen[ann_id] then
-        ann_seen[ann_id] = true
-        table.insert(ann_order, ann_id)
-      end
-      ann_last_row[ann_id] = i
-
-      local is_new_segment = (prev_ann_id ~= ann_id) or (prev_segment_idx ~= segment_idx)
-
-      if is_new_segment then
-        place_mark(
-          buf,
-          buf_line,
-          { right_gravity = false },
-          ann_id,
-          "seg_start",
-          segment_idx
-        )
-      else
-        -- same annotation, same segment_idx → wrap continuation
-        place_mark(
-          buf,
-          buf_line,
-          { right_gravity = false },
-          ann_id,
-          "wrap_cont",
-          segment_idx
-        )
-      end
-
-      prev_ann_id = ann_id
-      prev_segment_idx = segment_idx
-    else
-      -- empty / spill / nil-ann rows break any in-flight segment continuation
-      prev_ann_id = nil
-      prev_segment_idx = nil
-    end
-  end
-
-  -- Place one ann_end per annotation at the row AFTER its last row.
-  -- If that would land past the buffer's last line, place it at the last
-  -- buffer line with right_gravity=true so it stays pinned to EOF.
-  for _, ann_id in ipairs(ann_order) do
-    local last_row = ann_last_row[ann_id] -- 1-indexed array position
-    local end_line = last_row -- 0-indexed buffer line directly after last_row-1
-    if end_line >= buf_line_count then
-      end_line = buf_line_count - 1
-    end
-    if end_line < 0 then
-      end_line = 0
-    end
-    place_mark(
-      buf,
-      end_line,
-      { right_gravity = true },
-      ann_id,
-      "ann_end",
-      nil
-    )
-  end
-end
-
---- Return one structured region per annotation, computed from live extmark positions.
----@param buf integer
----@return table[] regions
-function M.get_regions(buf)
-  local result = {}
-  if not buf_is_valid(buf) then
-    return result
-  end
-  local entries = regions_by_buf[buf]
-  if not entries then
-    return result
-  end
-
-  -- Group entries by ann_id, resolving live row from each extmark id.
-  local by_ann = {}
-  local ann_order = {}
-
-  for extmark_id, meta in pairs(entries) do
-    local ok, pos = pcall(
-      nvim.api.nvim_buf_get_extmark_by_id,
-      buf,
-      ns_id,
-      extmark_id,
-      {}
-    )
-    if ok and type(pos) == "table" and pos[1] ~= nil then
-      local row = pos[1]
-      local ann_id = meta.ann_id
-      if not by_ann[ann_id] then
-        by_ann[ann_id] = { starts = {}, ann_end = nil }
-        table.insert(ann_order, ann_id)
-      end
-      if meta.role == "seg_start" then
-        table.insert(by_ann[ann_id].starts, {
-          row = row,
-          segment_idx = meta.segment_idx,
-        })
-      elseif meta.role == "ann_end" then
-        by_ann[ann_id].ann_end = row
-      end
-      -- wrap_cont marks are not needed for segment shape — their rows are
-      -- implied by the gap between this seg_start and the next.
-    end
-  end
-
-  for _, ann_id in ipairs(ann_order) do
-    local data = by_ann[ann_id]
-    table.sort(data.starts, function(a, b)
-      return (a.segment_idx or 0) < (b.segment_idx or 0)
-    end)
-
-    local segments = {}
-    local first_start_row = data.starts[1] and data.starts[1].row or nil
-    for i, ss in ipairs(data.starts) do
-      local next_row
-      if i < #data.starts then
-        next_row = data.starts[i + 1].row
-      else
-        next_row = data.ann_end or ss.row
-      end
-      local end_row = next_row > ss.row and (next_row - 1) or ss.row
-      table.insert(segments, {
-        kind = (ss.segment_idx == 0) and "title" or "content",
-        segment_idx = ss.segment_idx,
-        buf_lines = { ss.row, end_row },
-      })
-    end
-
-    local collapsed = false
-    if data.ann_end ~= nil and first_start_row ~= nil then
-      collapsed = data.ann_end <= first_start_row
-    end
-
-    table.insert(result, {
-      ann_id = ann_id,
-      segments = segments,
-      end_marker_row = data.ann_end,
-      collapsed = collapsed,
-    })
-  end
-
-  return result
-end
-
---- Return the role of the extmark at a given 0-indexed buffer row.
---- Returns "seg_start", "wrap_cont", "ann_end", or "none".
----@param buf integer
----@param row integer 0-indexed buffer row
----@return string role
-function M.get_role_at(buf, row)
-  if not buf_is_valid(buf) then
-    return "none"
-  end
-  local entries = regions_by_buf[buf]
-  if not entries then
-    return "none"
-  end
-
-  local ok, marks = pcall(
-    nvim.api.nvim_buf_get_extmarks,
-    buf,
-    ns_id,
-    { row, 0 },
-    { row, -1 },
-    { details = false }
-  )
-  if not ok or type(marks) ~= "table" then
-    return "none"
-  end
-
-  -- Prefer seg_start > wrap_cont > ann_end if multiple coincide.
-  local priority = { seg_start = 3, wrap_cont = 2, ann_end = 1 }
-  local best_role = nil
-  local best_score = 0
-  for _, mark in ipairs(marks) do
-    local id = mark[1]
-    local mark_row = mark[2]
-    if mark_row == row then
-      local meta = entries[id]
-      if meta then
-        local score = priority[meta.role] or 0
-        if score > best_score then
-          best_score = score
-          best_role = meta.role
+  registry[buf] = reg
+  local seen_ann = {}
+  local row = 0
+  for _, r in ipairs((layout and layout.rows) or {}) do
+    if r.row_kind ~= "closer" then
+      if r.ann_id then
+        local id = vim.api.nvim_buf_set_extmark(buf, ns_id, row, 0, { invalidate = true })
+        reg.rows[id] = { ann_id = r.ann_id, row_kind = r.row_kind, sep = r.sep }
+        if not seen_ann[r.ann_id] then
+          seen_ann[r.ann_id] = true
+          table.insert(reg.ann_ids, r.ann_id)
         end
       end
+      if r.source_line then
+        local id = vim.api.nvim_buf_set_extmark(buf, block_ns, row, 0, { invalidate = true })
+        reg.blocks[id] = r.source_line
+        if reg.source_buf and not reg.line_marks[r.source_line] then
+          local ok, mark = pcall(vim.api.nvim_buf_set_extmark, reg.source_buf, source_ns(buf), r.source_line - 1, 0, {})
+          reg.line_marks[r.source_line] = ok and mark or nil
+        end
+      end
+      row = row + 1
     end
   end
+end
 
-  return best_role or "none"
+--- Annotation ids placed by the last `place()`.
+---@param buf integer
+---@return string[]
+function M.placed_ann_ids(buf)
+  return (registry[buf] and registry[buf].ann_ids) or {}
+end
+
+-- row (0-indexed) -> metadata of the leftmost valid mark on that row
+local function leftmost(buf, ns, meta)
+  local by_row, col_of = {}, {}
+  for _, m in ipairs(vim.api.nvim_buf_get_extmarks(buf, ns, 0, -1, { details = true })) do
+    local id, row, col, details = m[1], m[2], m[3], m[4]
+    if meta[id] and not details.invalid and (col_of[row] == nil or col < col_of[row]) then
+      by_row[row], col_of[row] = meta[id], col
+    end
+  end
+  return by_row
+end
+
+--- Rebuild the aside rows from the live buffer. Returns one entry per buffer
+--- line (fields: lnum, source_line, text, ann_id?, row_kind, sep?) with a
+--- synthetic `row_kind = "closer"` entry (no lnum) after the last row of each
+--- annotation that has two or more rows.
+---@param buf integer
+---@param layout table? Fallback source lines for unmarked rows
+---@return table[]
+function M.read(buf, layout)
+  if not buf_is_valid(buf) then
+    return {}
+  end
+  local reg = registry[buf] or { rows = {}, blocks = {} }
+  local rows = leftmost(buf, ns_id, reg.rows)
+  local blocks = leftmost(buf, block_ns, reg.blocks)
+  local now = {} -- source line at render -> source line now
+  if buf_is_valid(reg.source_buf) then
+    local pos = {}
+    for _, m in ipairs(vim.api.nvim_buf_get_extmarks(reg.source_buf, source_ns(buf), 0, -1, {})) do
+      pos[m[1]] = m[2] + 1
+    end
+    for line, id in pairs(reg.line_marks) do
+      now[line] = pos[id]
+    end
+  end
+  local fallback = (layout and layout.rows) or {}
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+
+  local entries, prev = {}, nil
+  for i, text in ipairs(lines) do
+    local r = i - 1
+    local mark = rows[r]
+    local block = blocks[r] and (now[blocks[r]] or blocks[r])
+    local e = { lnum = i, text = text, source_line = block or (prev and prev.source_line)
+      or (fallback[i] and fallback[i].source_line) or 1 }
+    if mark then
+      e.ann_id, e.row_kind, e.sep = mark.ann_id, mark.row_kind, mark.sep
+    elseif prev and not blocks[r] then
+      e.ann_id, e.row_kind = prev.ann_id, prev.ann_id and "inserted" or "empty"
+    else
+      e.row_kind = "empty"
+    end
+    table.insert(entries, e)
+    prev = e
+  end
+
+  local count, last = {}, {}
+  for i, e in ipairs(entries) do
+    if e.ann_id then
+      count[e.ann_id] = (count[e.ann_id] or 0) + 1
+      last[e.ann_id] = i
+    end
+  end
+  local out = {}
+  for i, e in ipairs(entries) do
+    table.insert(out, e)
+    if e.ann_id and last[e.ann_id] == i and count[e.ann_id] >= 2 then
+      table.insert(out, { ann_id = e.ann_id, row_kind = "closer", source_line = e.source_line, attach = i })
+    end
+  end
+  return out
+end
+
+--- Role of the row's own mark: "seg_start" (starts a logical line),
+--- "wrap_cont" (continues the previous row), or "none".
+---@param buf integer
+---@param row integer 0-indexed
+---@return string
+function M.get_role_at(buf, row)
+  if not buf_is_valid(buf) or not registry[buf] then
+    return "none"
+  end
+  local mark = leftmost(buf, ns_id, registry[buf].rows)[row]
+  if not mark then
+    return "none"
+  end
+  return mark.sep and "wrap_cont" or "seg_start"
 end
 
 return M

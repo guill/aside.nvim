@@ -344,9 +344,9 @@ Annotations appear as virtual lines below the annotated code:
 
 ### aside
 
-Opens a vertical split panel to the right. In aside mode, annotations line up row-by-row with the source buffer so each annotation line sits next to its anchor code. This row alignment keeps the annotation text aligned with its anchor code. The gutter uses a 2-column non-editable statuscolumn: an outer box plus inner anchor brackets.
+Opens a vertical split panel to the right. In aside mode, annotations line up row-by-row with the source buffer so each annotation line sits next to its anchor code. Alignment holds while scrolling either pane, with wrapped source lines, closed folds (mirrored in the panel), `scrolloff`, and virtual lines from other plugins. The gutter is a 2-column non-editable sign column: an outer bracket over the anchored source lines plus an inner box around the annotation.
 
-The annotation text itself is editable; save with `:w` to persist changes. Type-to-create is supported: typing on empty aside rows creates new annotations on save. Each source window can have its own per-window aside panel, and switching the source file automatically switches the aside content for that window. If you switch families while there are unsaved edits, the change is refused until you `:w` or `:e!` first.
+The annotation text itself is editable; save with `:w` to persist changes, or `:e!` to discard them. The panel realigns live while you add or remove lines, and re-renders from storage are deferred while it has unsaved edits. Type-to-create is supported: typing on empty aside rows creates new annotations on save. Removing all of an annotation's text asks for confirmation on save; cancelling aborts the whole save. Each source window can have its own per-window aside panel, and switching the source file automatically switches the aside content for that window (unsaved edits are kept for when you switch back). If you switch families while there are unsaved edits, the change is refused until you `:w` or `:e!` first.
 
 ```lua
 aside.open_aside({ family = "pr_comments", win = 0 })

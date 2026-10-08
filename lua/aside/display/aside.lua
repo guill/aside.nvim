@@ -1,81 +1,800 @@
+--- Aside panel: a split next to a source window whose rows line up with the
+--- source lines they annotate.
+---
+--- Alignment model. The aside buffer is split into one block per source line
+--- (aside_extmarks tracks which rows belong to which block, also while the
+--- user edits). Consecutive source lines inside a closed fold form one group;
+--- otherwise each line is its own group. For every group:
+---   source rows S_src = text rows (wrap) + foreign virt_lines
+---   aside rows  S_asd = buffer rows + closer virt_lines (1 if folded)
+---   S = max(S_src, S_asd); the shorter side gets virt_line padding.
+--- Both windows then show exactly S rows per group, so a view in one window
+--- maps to the same (group, row offset) in the other (see `sync`).
+
 local M = {}
 
 local state = require("aside.state")
 local config = require("aside.config")
+local extmarks = require("aside.display.aside_extmarks")
+local layout_mod = require("aside.layout")
 
-local aside_windows = {}
+local windows = {} -- source_win -> panel window state
+local pstate = {} -- aside buf -> { layout }
+local orphans = {} -- panel key -> modified aside buf whose window was closed
 
--- Dedicated namespace for highlight extmarks (separate from edit-region marks).
 local hl_ns = vim.api.nvim_create_namespace("aside_render_hl")
+local virt_ns = vim.api.nvim_create_namespace("aside_virt")
+local check_ns = vim.api.nvim_create_namespace("aside_check")
+local gutter_ns = vim.api.nvim_create_namespace("aside_gutter")
+local group = vim.api.nvim_create_augroup("AsidePanel", { clear = false })
 
--- Dedicated namespace for source-side virt_lines padding (Task 15).
--- Must be module-level so M.close can clear it safely.
-local source_padding_ns = vim.api.nvim_create_namespace("aside_source_padding")
+local ANCHOR_GLYPH = {
+  top = "\226\148\144", middle = "\226\148\130", bottom = "\226\148\152", -- ┐ │ ┘
+  single = "\226\148\130", connector = "\226\148\156", none = " ", -- │ ├
+}
+local BOX_GLYPH = {
+  top = "\226\148\140", middle = "\226\148\130", bottom = "\226\148\148", -- ┌ │ └
+  single = "\226\148\128", connector = "\226\148\164", none = " ", -- ─ ┤
+}
+local VBAR = "\226\148\130"
+local CLOSER_DASHES = string.rep("\226\148\128", 13)
 
---- Resolve the given window id (with 0/nil = current) to the source window
---- that owns an aside panel. If the input is itself an aside window, return
---- the corresponding source window so callers like `set_family`, `close`, and
---- `get_aside_data` work regardless of whether the user is focused on the
---- source pane or the aside pane.
----@param win integer|nil
----@return integer resolved_win Source window id, or original win if not aside
+local function valid_win(w)
+  return type(w) == "number" and vim.api.nvim_win_is_valid(w)
+end
+
+local function valid_buf(b)
+  return type(b) == "number" and vim.api.nvim_buf_is_valid(b)
+end
+
+local function panel_key(family, path)
+  return family .. "\0" .. path
+end
+
+--- Source window owning the panel shown in `win` (or `win` itself).
 local function resolve_source_win(win)
   win = (win == nil or win == 0) and vim.api.nvim_get_current_win() or win
-  if aside_windows[win] then
+  if windows[win] then
     return win
   end
-  for source_win, data in pairs(aside_windows) do
-    if data and data.win == win then
+  for source_win, data in pairs(windows) do
+    if data.win == win then
       return source_win
     end
   end
   return win
 end
 
-
-
---- Test helper: inject aside_data for testing render without a real window.
---- The provided `data` table is stored as-is under `source_win` and may include
---- pre-computed fields (e.g. `wrap_width`) that bypass live window queries.
-function M._test_set_data(source_win, data)
-  aside_windows[source_win] = data
+local function owner_of(buf)
+  for source_win, W in pairs(windows) do
+    if W.buf == buf then
+      return source_win, W
+    end
+  end
 end
 
---- Test/introspection helper: retrieve the internal aside_data for a source window.
+local function is_modified(W)
+  return W.modified == true or (valid_buf(W.buf) and vim.bo[W.buf].modified) or false
+end
+
+local function family_config(name)
+  local family = state.get_family(name)
+  return (family and family:get_config()) or {}
+end
+
+local function pad_ns(W)
+  if not W.pad_ns then
+    W.pad_ns = vim.api.nvim_create_namespace("aside_source_padding_" .. W.source_win)
+    -- Scope to the source window: another window on the same buffer has its
+    -- own panel and needs its own padding.
+    pcall(vim.api.nvim__ns_set, W.pad_ns, { wins = { W.source_win } })
+  end
+  return W.pad_ns
+end
+
+local function clear_padding(W)
+  if valid_buf(W.pad_buf) then
+    pcall(vim.api.nvim_buf_clear_namespace, W.pad_buf, pad_ns(W), 0, -1)
+  end
+  W.pad, W.pad_buf = {}, nil
+end
+
+-- ---------------------------------------------------------------------------
+-- Scroll sync
+-- ---------------------------------------------------------------------------
+
+local function view(win)
+  return vim.api.nvim_win_call(win, vim.fn.winsaveview)
+end
+
+local function view_key(win)
+  local v = view(win)
+  return v.topline .. ":" .. v.topfill .. ":" .. v.skipcol
+end
+
+--- Scroll `win` to (topline, topfill). Moves the cursor only when it would
+--- leave the view (respecting 'scrolloff'), so Neovim does not scroll back.
+local function set_view(win, topline, topfill)
+  vim.api.nvim_win_call(win, function()
+    local v = vim.fn.winsaveview()
+    if v.topline == topline and v.topfill == topfill then
+      return
+    end
+    vim.fn.winrestview({ topline = topline, topfill = topfill })
+    local so = vim.wo.scrolloff >= 0 and vim.wo.scrolloff or vim.go.scrolloff
+    local last, bot = vim.fn.line("$"), vim.fn.line("w$")
+    local lo = topline == 1 and 1 or math.min(topline + so, last)
+    local hi = bot >= last and last or math.max(bot - so, topline)
+    local lnum = v.lnum
+    if lo > hi then
+      lnum = math.floor((topline + bot) / 2)
+    elseif lnum < lo then
+      lnum = lo
+    elseif lnum > hi then
+      lnum = hi
+    end
+    if lnum ~= v.lnum then
+      vim.fn.winrestview({ topline = topline, topfill = topfill, lnum = lnum, col = 0, curswant = v.curswant })
+    end
+  end)
+end
+
+-- (group, offset) at the top of the source view.
+local function source_pos(W)
+  local v = view(W.source_win)
+  local g = W.line_group[v.topline] or #W.groups
+  if v.topfill > 0 and g > 1 then
+    g = g - 1
+    return g, math.max(0, W.groups[g].S - v.topfill)
+  end
+  return g, 0
+end
+
+-- (group, offset) at the top of the aside view.
+local function aside_pos(W)
+  local v = view(W.win)
+  local idx
+  if v.topfill > 0 then
+    local row = v.topline - 2
+    local n = W.virt_n[row] or 0
+    idx = W.virt_item[row .. ":" .. (n - v.topfill + 1)]
+  end
+  idx = idx or W.row_item[v.topline]
+  local item = idx and W.seq[idx]
+  if not item then
+    return nil
+  end
+  return item.g, idx - W.groups[item.g].first_item
+end
+
+local function aside_view_for(W, g, k)
+  local grp = W.groups[g]
+  if not grp then
+    return nil
+  end
+  local item = W.seq[grp.first_item + math.max(0, math.min(k, grp.S - 1))]
+  if not item then
+    return nil
+  end
+  if item.row then
+    return item.row, 0
+  end
+  local count = vim.api.nvim_buf_line_count(W.buf)
+  local top = item.vrow + 2
+  if top > count then
+    return count, 0
+  end
+  return top, (W.virt_n[item.vrow] or 0) - item.vi + 1
+end
+
+-- `dir` picks the side to round to when the offset falls inside a wrapped
+-- source line (a topline cannot start mid-line without 'smoothscroll').
+local function source_view_for(W, g, k, dir)
+  local grp = W.groups[g]
+  if k < grp.text then
+    if k == 0 or dir < 0 then
+      return grp.first, 0
+    end
+    k = grp.text
+  end
+  local nxt = W.groups[g + 1]
+  if not nxt then
+    return grp.first, 0
+  end
+  return nxt.first, grp.S - k
+end
+
+--- Bring the two views back in line. `origin` names the window whose view
+--- wins ("source" / "aside"); nil detects which one moved since last sync.
+local function sync(W, origin)
+  if not W.groups or not (valid_win(W.source_win) and valid_win(W.win)) then
+    return
+  end
+  if vim.api.nvim_win_get_buf(W.win) ~= W.buf then
+    return
+  end
+  if not origin then
+    if not W.last or view_key(W.source_win) ~= W.last.src then
+      origin = "source"
+    elseif view_key(W.win) ~= W.last.aside then
+      origin = "aside"
+    else
+      return
+    end
+  end
+  if origin == "aside" then
+    local g, k = aside_pos(W)
+    if g then
+      local dir = 1
+      if W.pos and (g < W.pos[1] or (g == W.pos[1] and k < W.pos[2])) then
+        dir = -1
+      end
+      set_view(W.source_win, source_view_for(W, g, k, dir))
+    end
+  end
+  local g, k = source_pos(W)
+  local top, fill = aside_view_for(W, g, k)
+  if top then
+    set_view(W.win, top, fill)
+  end
+  W.pos = { g, k }
+  W.last = { src = view_key(W.source_win), aside = view_key(W.win) }
+end
+
+-- ---------------------------------------------------------------------------
+-- Alignment
+-- ---------------------------------------------------------------------------
+
+--- Measure the source window: fold groups, text rows per line (wrap) and
+--- virt_lines placed by other plugins (all treated as below the line).
+local function measure(W, source_buf)
+  local src = W.source_win
+  local n = vim.api.nvim_buf_line_count(source_buf)
+  local pad = (W.pad_buf == source_buf and W.pad) or {}
+  local groups, line_group = {}, {}
+  vim.api.nvim_win_call(src, function()
+    local spans, line = {}, 1
+    while line <= n do
+      local fe = vim.fn.foldclosedend(line)
+      if fe > 0 then
+        table.insert(spans, { line, fe, true })
+        line = fe + 1
+      else
+        table.insert(spans, { line, line, false })
+        line = line + 1
+      end
+    end
+    local total = vim.api.nvim_win_text_height(src, {})
+    local our = 0
+    for _, c in pairs(pad) do our = our + c end
+    -- Fast path: every visible line is one row and all fill is ours.
+    local simple = total.fill == our and total.all - total.fill == #spans
+    for _, sp in ipairs(spans) do
+      local g = { first = sp[1], last = sp[2], fold = sp[3], text = 1, foreign = 0 }
+      local prev = groups[#groups]
+      if not simple then
+        -- A line's "fill" is the filler drawn ABOVE it, i.e. virt_lines
+        -- below the previous line: credit it to the previous group.
+        local h = vim.api.nvim_win_text_height(src, { start_row = sp[1] - 1, end_row = sp[1] - 1 })
+        if not sp[3] then g.text = h.all - h.fill end
+        if prev then prev.foreign = math.max(0, h.fill - (pad[prev.last] or 0)) end
+      end
+      table.insert(groups, g)
+      for l = sp[1], sp[2] do line_group[l] = #groups end
+    end
+  end)
+  return { buf = source_buf, n = n, groups = groups, line_group = line_group }
+end
+
+-- Gutter glyphs for a filler row between two buffer rows.
+local function filler_glyphs(prev, nxt)
+  local inner, outer = " ", " "
+  if prev and nxt and prev.ann_id and prev.ann_id == nxt.ann_id then
+    inner = VBAR
+  end
+  local open = { top = true, middle = true, connector = true }
+  local cont = { middle = true, bottom = true, connector = true }
+  if prev and nxt and open[prev.anchor_position] and cont[nxt.anchor_position] then
+    outer = VBAR
+  end
+  return outer .. inner
+end
+
+local function apply_folds(W, folds)
+  local sig = vim.inspect(folds)
+  if W.fold_sig == sig then
+    return
+  end
+  W.fold_sig = sig
+  vim.api.nvim_win_call(W.win, function()
+    vim.cmd("silent! normal! zE")
+    for _, f in ipairs(folds) do
+      vim.cmd(("silent! %d,%dfold"):format(f[1], f[2]))
+    end
+  end)
+end
+
+--- Recompute padding on both sides from the live aside rows and the source
+--- measurements, then re-sync the views. Never rewrites aside text.
+local function realign(W, remeasure)
+  local src, buf = W.source_win, W.buf
+  if not (valid_win(src) and valid_win(W.win) and valid_buf(buf)) or not W.layout then
+    return
+  end
+  if vim.api.nvim_win_get_buf(W.win) ~= buf then
+    return
+  end
+  local source_buf = vim.api.nvim_win_get_buf(src)
+  if remeasure or not W.measure or W.measure.buf ~= source_buf then
+    W.measure = measure(W, source_buf)
+  end
+  local m = W.measure
+
+  local live = extmarks.read(buf, W.layout)
+  local anns = {}
+  for _, a in ipairs(W.layout.annotations or {}) do
+    local cur = state.get_annotation(a.id)
+    table.insert(anns, cur and { id = a.id, start_line = cur.start_line, end_line = cur.end_line } or a)
+  end
+  layout_mod.decorate(live, anns)
+  local rows, per_block = {}, {}
+  for _, e in ipairs(live) do
+    if e.lnum then rows[e.lnum] = e end
+    local line = math.max(1, math.min(e.source_line, m.n))
+    per_block[line] = per_block[line] or {}
+    table.insert(per_block[line], e)
+  end
+
+  local seq, row_item, virt, virt_item, folds, pads = {}, {}, {}, {}, {}, {}
+  local last_row = -1 -- 0-indexed buffer row new virt_lines attach below
+  local function add_virt(g, item)
+    virt[last_row] = virt[last_row] or {}
+    table.insert(virt[last_row], item)
+    table.insert(seq, { g = g, vrow = last_row, vi = #virt[last_row] })
+    virt_item[last_row .. ":" .. #virt[last_row]] = #seq
+  end
+  local function add_row(g, lnum)
+    table.insert(seq, { g = g, row = lnum })
+    row_item[lnum] = #seq
+    last_row = lnum - 1
+  end
+
+  for gi, grp in ipairs(m.groups) do
+    grp.first_item = #seq + 1
+    local visible = 0
+    if grp.fold then
+      local fold_rows = {}
+      for line = grp.first, grp.last do
+        for _, e in ipairs(per_block[line] or {}) do
+          if e.lnum then table.insert(fold_rows, e.lnum) end
+        end
+      end
+      if #fold_rows > 0 then
+        add_row(gi, fold_rows[1])
+        last_row = fold_rows[#fold_rows] - 1
+        if #fold_rows > 1 then table.insert(folds, { fold_rows[1], fold_rows[#fold_rows] }) end
+        visible = 1
+      end
+    else
+      for _, e in ipairs(per_block[grp.first] or {}) do
+        if e.lnum then
+          add_row(gi, e.lnum)
+        else
+          add_virt(gi, { closer = e })
+        end
+        visible = visible + 1
+      end
+    end
+    local src_rows = grp.text + grp.foreign
+    grp.S = math.max(src_rows, visible)
+    for _ = visible + 1, grp.S do
+      add_virt(gi, { fill = true })
+    end
+    if grp.S > src_rows and not grp.fold then
+      pads[grp.last] = grp.S - src_rows
+    end
+  end
+
+  -- Source padding (window-scoped).
+  local ns = pad_ns(W)
+  if W.pad_buf and W.pad_buf ~= source_buf then
+    clear_padding(W)
+  end
+  vim.api.nvim_buf_clear_namespace(source_buf, ns, 0, -1)
+  for line, count in pairs(pads) do
+    local lines = {}
+    for _ = 1, count do table.insert(lines, { { "", "Normal" } }) end
+    pcall(vim.api.nvim_buf_set_extmark, source_buf, ns, line - 1, 0, { virt_lines = lines })
+  end
+  W.pad, W.pad_buf = pads, source_buf
+
+  -- Aside virt_lines: closers and filler, drawn over the gutter.
+  vim.api.nvim_buf_clear_namespace(buf, virt_ns, 0, -1)
+  local virt_n = {}
+  for row, items in pairs(virt) do
+    virt_n[row] = #items
+    local lines = {}
+    for _, it in ipairs(items) do
+      local text
+      if it.closer then
+        text = ANCHOR_GLYPH[it.closer.anchor_position] .. BOX_GLYPH.bottom .. CLOSER_DASHES
+      else
+        text = filler_glyphs(rows[row + 1], rows[row + 2])
+      end
+      table.insert(lines, { { text, "AsideBorder" } })
+    end
+    local above = row < 0
+    pcall(vim.api.nvim_buf_set_extmark, buf, virt_ns, above and 0 or row, 0, {
+      virt_lines = lines, virt_lines_above = above, virt_lines_leftcol = true,
+    })
+  end
+
+  -- Gutter glyphs as signs. ('statuscolumn' is evaluated with the previous
+  -- line's v:lnum for a topline whose filler is scrolled off, which drew
+  -- the wrong glyphs; signs are placed per line and do not have that bug.)
+  vim.api.nvim_buf_clear_namespace(buf, gutter_ns, 0, -1)
+  for lnum, e in pairs(rows) do
+    local glyphs = ANCHOR_GLYPH[e.anchor_position] .. BOX_GLYPH[e.box_position]
+    if glyphs ~= "  " then
+      pcall(vim.api.nvim_buf_set_extmark, buf, gutter_ns, lnum - 1, 0, { sign_text = glyphs, sign_hl_group = "AsideBorder" })
+    end
+  end
+
+  apply_folds(W, folds)
+
+  W.rows, W.seq, W.row_item, W.virt_n, W.virt_item = rows, seq, row_item, virt_n, virt_item
+  W.groups, W.line_group = m.groups, m.line_group
+  sync(W, vim.api.nvim_get_current_win() == W.win and "aside" or "source")
+end
+
+-- Re-measure when what the source window shows (folds, wrapping, other
+-- plugins' virt_lines) no longer matches the model in the visible range.
+local function check(W)
+  local src, m = W.source_win, W.measure
+  if not m or not valid_win(src) or vim.api.nvim_win_get_buf(src) ~= m.buf then
+    return
+  end
+  if vim.api.nvim_buf_line_count(m.buf) ~= m.n then
+    return -- the source was edited; the pending re-render handles it
+  end
+  local stale, sig = false, {}
+  vim.api.nvim_win_call(src, function()
+    local line, bot = vim.fn.line("w0"), vim.fn.line("w$")
+    while line <= bot do
+      local fe = vim.fn.foldclosedend(line)
+      local g = m.groups[m.line_group[line]]
+      if fe > 0 then
+        table.insert(sig, line .. "-" .. fe)
+        stale = stale or not (g and g.fold and g.first == line and g.last == fe)
+        line = fe + 1
+      else
+        local h = vim.api.nvim_win_text_height(src, { start_row = line - 1, end_row = line - 1 })
+        local prev = g and m.groups[m.line_group[line] - 1]
+        table.insert(sig, h.all .. "/" .. h.fill)
+        stale = stale or not g or g.fold or h.all - h.fill ~= g.text
+          or (prev ~= nil and h.fill ~= prev.foreign + ((W.pad or {})[prev.last] or 0))
+        line = line + 1
+      end
+    end
+  end)
+  sig = table.concat(sig, ",")
+  if stale and W.stale_sig ~= sig then
+    W.stale_sig = sig -- never retry the same mismatch (no redraw loops)
+    realign(W, true)
+  end
+end
+
+-- ---------------------------------------------------------------------------
+-- Rendering
+-- ---------------------------------------------------------------------------
+
+local function set_layout(W, layout)
+  W.layout = layout
+  if valid_buf(W.buf) then
+    pstate[W.buf] = { layout = layout }
+  end
+end
+
+local function highlight(buf, layout, icon, hl_groups)
+  vim.api.nvim_buf_clear_namespace(buf, hl_ns, 0, -1)
+  local prefix = icon .. " "
+  local row = 0
+  for _, r in ipairs(layout.rows) do
+    if r.row_kind ~= "closer" then
+      local text = r.text or ""
+      local from = 0
+      if r.row_kind == "title" and vim.startswith(text, prefix) then
+        pcall(vim.api.nvim_buf_set_extmark, buf, hl_ns, row, 0, { end_col = #prefix, hl_group = hl_groups.gutter or "AsideGutter" })
+        from = #prefix
+      end
+      local group_name = r.row_kind == "title" and (hl_groups.title or "AsideTitle")
+        or r.row_kind == "content" and (hl_groups.contents or "AsideContents")
+      if group_name and #text > from then
+        pcall(vim.api.nvim_buf_set_extmark, buf, hl_ns, row, from, { end_col = #text, hl_group = group_name })
+      end
+      row = row + 1
+    end
+  end
+end
+
+--- Re-render the panel for `source_win`. While the panel has unsaved edits
+--- (or is in insert mode) the text is kept and only alignment is refreshed;
+--- the full render is deferred until `:w` / `:e!` (`force` overrides).
+---@param source_win integer
+---@param force? boolean
+function M.render(source_win, force)
+  local W = windows[source_win]
+  if not W then
+    return
+  end
+  if not force and (W.in_insert or is_modified(W)) then
+    W.deferred_render = true
+    return realign(W, true)
+  end
+  W.deferred_render = false
+  if not (valid_win(source_win) and valid_buf(W.buf)) then
+    return
+  end
+  local source_buf = vim.api.nvim_win_get_buf(source_win)
+  local path = vim.api.nvim_buf_get_name(source_buf)
+
+  local anns = {}
+  if path ~= "" then
+    for _, a in ipairs(require("aside.annotations").get_by_file(path)) do
+      if a.family == W.family then table.insert(anns, a) end
+    end
+  end
+  local fc = family_config(W.family)
+  local icon = fc.gutter_icon or config.get_value("default_gutter_icon", "\226\151\143")
+  local width = valid_win(W.win) and vim.api.nvim_win_get_width(W.win) or (fc.aside_width or config.get_value("aside_width", 40))
+  W.width = width
+  local layout = layout_mod.get(fc.layout_solver or config.get_value("layout_solver", "greedy")).solve(
+    anns,
+    vim.api.nvim_buf_line_count(source_buf),
+    {
+      spill_direction = fc.spill_direction or config.get_value("spill_direction", "below"),
+      wrap_width = math.max(1, width - 2 - 1), -- 2 gutter cols + 1 for the cursor
+      gutter_icon = icon,
+    }
+  )
+
+  local lines = {}
+  for _, r in ipairs(layout.rows) do
+    if r.row_kind ~= "closer" then table.insert(lines, r.text or "") end
+  end
+  local buf = W.buf
+  -- Writing with 'undolevels' -1 also clears undo history, so `u` cannot
+  -- undo a render.
+  local undolevels = vim.bo[buf].undolevels
+  vim.bo[buf].undolevels = -1
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].undolevels = undolevels
+  vim.bo[buf].modified = false
+
+  highlight(buf, layout, icon, fc.highlight_groups or config.get().highlight_groups or {})
+  extmarks.place(buf, layout, source_buf)
+  set_layout(W, layout)
+  realign(W, true)
+end
+
+-- ---------------------------------------------------------------------------
+-- Panel buffers
+-- ---------------------------------------------------------------------------
+
+local function save(source_win, W)
+  local buf = W.buf
+  require("aside.display.aside_save").handle_save(buf, W.source_path, W.family, W.layout, function()
+    if windows[source_win] == W and W.buf == buf then
+      M.render(source_win, true)
+    end
+  end)
+end
+
+local function attach_buffer_autocmds(buf)
+  local function on(events, fn)
+    vim.api.nvim_create_autocmd(events, {
+      group = group,
+      buffer = buf,
+      callback = function()
+        local source_win, W = owner_of(buf)
+        if W then fn(source_win, W) end
+      end,
+    })
+  end
+  on("BufWriteCmd", save)
+  on("BufReadCmd", function(source_win) M.render(source_win, true) end)
+  on({ "TextChanged", "TextChangedI" }, function(_, W) realign(W) end)
+  on("InsertEnter", function(_, W) W.in_insert = true end)
+  on("InsertLeave", function(source_win, W)
+    W.in_insert = false
+    if W.pending_family then
+      local pending = W.pending_family
+      W.pending_family = nil
+      return M.set_family(source_win, pending)
+    end
+    if W.deferred_render then
+      M.render(source_win)
+    end
+  end)
+end
+
+local function wipe_panel(buf)
+  pstate[buf] = nil
+  extmarks.clear(buf)
+  if valid_buf(buf) then
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+  end
+end
+
+-- Panel buffer for (W.family, path): reuse an unsaved one left behind by a
+-- closed window, else create one.
+local function get_panel(W, path)
+  local key = panel_key(W.family, path)
+  local buf = W.panels[key]
+  if not valid_buf(buf) then
+    buf = orphans[key]
+    orphans[key] = nil
+  end
+  if not valid_buf(buf) then
+    buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[buf].buftype = "acwrite"
+    vim.bo[buf].bufhidden = "hide"
+    vim.bo[buf].swapfile = false
+    vim.bo[buf].filetype = "aside"
+    local name = "aside://" .. W.family .. "/" .. path
+    if not pcall(vim.api.nvim_buf_set_name, buf, name) then
+      pcall(vim.api.nvim_buf_set_name, buf, name .. " #" .. W.source_win)
+    end
+    attach_buffer_autocmds(buf)
+  end
+  W.panels[key] = buf
+  return buf
+end
+
+-- Show the panel for the current family/path in the aside window.
+local function show_panel(W)
+  W.buf = get_panel(W, W.source_path)
+  local layout = pstate[W.buf] and pstate[W.buf].layout
+  W.layout, W.measure, W.fold_sig, W.last = layout, nil, nil, nil
+  if valid_win(W.win) and vim.api.nvim_win_get_buf(W.win) ~= W.buf then
+    vim.api.nvim_win_set_buf(W.win, W.buf)
+  end
+end
+
+-- Switch the aside window to the panel for (family, path). The previous
+-- panel is wiped unless it holds unsaved edits; it is replaced in the window
+-- first, since deleting a displayed buffer would close the window.
+local function switch_panel(W, family, path)
+  local old_buf, old_key = W.buf, panel_key(W.family, W.source_path)
+  W.family, W.source_path = family, path
+  show_panel(W)
+  if old_buf ~= W.buf and valid_buf(old_buf) and not vim.bo[old_buf].modified then
+    W.panels[old_key] = nil
+    wipe_panel(old_buf)
+  end
+end
+
+-- ---------------------------------------------------------------------------
+-- Public API
+-- ---------------------------------------------------------------------------
+
+--- Test helper: inject panel state for a (possibly fake) source window.
+function M._test_set_data(source_win, data)
+  data.source_win = data.source_win or source_win
+  windows[source_win] = data
+end
+
 function M._test_get_data(source_win)
-  return aside_windows[source_win]
+  return windows[source_win]
+end
+
+local function setup_aside_win(win)
+  local wo = vim.wo[win]
+  wo.wrap = false
+  wo.number = false
+  wo.relativenumber = false
+  wo.signcolumn = "yes:1" -- one 2-cell sign: anchor bracket + box
+  wo.foldcolumn = "0"
+  wo.cursorline = false
+  wo.list = false
+  wo.spell = false
+  wo.foldmethod = "manual"
+  wo.foldenable = true
+  wo.foldminlines = 0
+  wo.scrolloff = 0
+  wo.sidescrolloff = 0
+  wo.winfixwidth = true
+  wo.statuscolumn = ""
 end
 
 function M.setup()
+  group = vim.api.nvim_create_augroup("AsidePanel", { clear = true })
+
   vim.api.nvim_create_autocmd("WinClosed", {
-    group = vim.api.nvim_create_augroup("AsidePanelClose", { clear = true }),
+    group = group,
     callback = function(args)
-      local closed_win = tonumber(args.match)
-      local aside_panel_source = nil
-      local source_win_closed = nil
-      for source_win, aside_data in pairs(aside_windows) do
-        if aside_data.win == closed_win then
-          aside_panel_source = source_win
-          break
-        end
-        if source_win == closed_win then
-          source_win_closed = source_win
-          break
+      local closed = tonumber(args.match)
+      for source_win, W in pairs(windows) do
+        if W.win == closed or source_win == closed then
+          W.closing = true
+          vim.schedule(function() M.close(source_win) end)
         end
       end
-      if aside_panel_source then
-        local aside_data = aside_windows[aside_panel_source]
-        if aside_data and aside_data.augroup_name then
-          pcall(vim.api.nvim_del_augroup_by_name, aside_data.augroup_name)
-        end
-        aside_windows[aside_panel_source] = nil
-      elseif source_win_closed then
-        M.close(source_win_closed)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("WinScrolled", {
+    group = group,
+    callback = function()
+      for _, W in pairs(windows) do
+        if not W.closing then sync(W) end
       end
+      -- Neovim snapshots views before running WinScrolled and only compares
+      -- again on its next main-loop pass. Views changed by the sync above
+      -- would otherwise stay unrecorded until the next key, and a key that
+      -- scrolls back to the stale snapshot would fire no WinScrolled at all.
+      vim.schedule(function() end)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("WinResized", {
+    group = group,
+    callback = function()
+      for source_win, W in pairs(windows) do
+        if not W.closing and valid_win(W.win) and valid_win(source_win) then
+          local widths = vim.api.nvim_win_get_width(W.win) .. ":" .. vim.api.nvim_win_get_width(source_win)
+          if W.widths ~= widths then
+            W.widths = widths
+            M.render(source_win)
+          else
+            sync(W)
+          end
+        end
+      end
+    end,
+  })
+
+  vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter" }, {
+    group = group,
+    callback = function()
+      for source_win in pairs(windows) do
+        vim.schedule(function() M.handle_source_change(source_win) end)
+      end
+    end,
+  })
+
+  -- Source edits: re-render after tracking has moved the annotations.
+  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+    group = group,
+    callback = function(args)
+      for source_win, W in pairs(windows) do
+        if valid_win(source_win) and vim.api.nvim_win_get_buf(source_win) == args.buf and not W.render_queued then
+          W.render_queued = true
+          vim.defer_fn(function()
+            W.render_queued = false
+            M.render(source_win)
+          end, 150)
+        end
+      end
+    end,
+  })
+
+  vim.api.nvim_set_decoration_provider(check_ns, {
+    on_win = function(_, winid)
+      local W = windows[winid]
+      if W and not W.check_queued then
+        W.check_queued = true
+        vim.schedule(function()
+          W.check_queued = false
+          if windows[winid] == W then check(W) end
+        end)
+      end
+      return false
     end,
   })
 end
 
+---@param opts {family: string, win?: integer, buf?: integer}
 function M.open(opts)
   opts = opts or {}
   local family_name = opts.family
@@ -83,730 +802,149 @@ function M.open(opts)
     vim.notify("aside: family is required for open_aside", vim.log.levels.ERROR)
     return
   end
-
-  -- Resolve source_win. Per spec, when opts.buf is provided we anchor to the
-  -- CURRENT window (not bufwinid) so the aside attaches to the window the user
-  -- is currently in.
-  local source_win
-  if opts.buf then
-    source_win = vim.api.nvim_get_current_win()
-  else
-    source_win = (opts.win == nil or opts.win == 0)
-        and vim.api.nvim_get_current_win()
-        or opts.win
-  end
-
-  if aside_windows[source_win] then
-    M.set_family(source_win, family_name)
-    return
+  local source_win = resolve_source_win(opts.buf and 0 or opts.win)
+  if windows[source_win] then
+    return M.set_family(source_win, family_name)
   end
 
   local source_buf = vim.api.nvim_win_get_buf(source_win)
   local source_path = vim.api.nvim_buf_get_name(source_buf)
-  if not source_path or source_path == "" then
-    vim.notify(
-      "aside: source buffer has no name; cannot open aside panel",
-      vim.log.levels.ERROR
-    )
+  if source_path == "" or vim.bo[source_buf].filetype == "aside" then
+    vim.notify("aside: source buffer has no name; cannot open aside panel", vim.log.levels.ERROR)
     return
   end
+  state.ensure_family(family_name)
 
-  if not state.family_exists(family_name) then
-    state.ensure_family(family_name)
-  end
-
-  local aside_buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[aside_buf].buftype = "acwrite"
-  vim.bo[aside_buf].bufhidden = "hide"
-  vim.bo[aside_buf].swapfile = false
-  vim.bo[aside_buf].filetype = "aside"
-  vim.bo[aside_buf].modifiable = true
-
-  local buf_name = "aside://" .. family_name .. "/" .. source_path
-  pcall(vim.api.nvim_buf_set_name, aside_buf, buf_name)
-
-  local current_win = vim.api.nvim_get_current_win()
-  vim.api.nvim_set_current_win(source_win)
-  vim.cmd("vertical rightbelow split")
-  local aside_win = vim.api.nvim_get_current_win()
-  vim.api.nvim_win_set_buf(aside_win, aside_buf)
-
-  local family = state.get_family(family_name)
-  local family_config = (family and family.get_config and family:get_config()) or {}
-  local aside_width = family_config.aside_width
-      or config.get_value("aside_width", 40)
-  pcall(vim.api.nvim_win_set_width, aside_win, aside_width)
-
-  vim.wo[aside_win].wrap = false
-  vim.wo[aside_win].number = false
-  vim.wo[aside_win].relativenumber = false
-  vim.wo[aside_win].signcolumn = "no"
-  vim.wo[aside_win].foldcolumn = "0"
-  vim.wo[aside_win].cursorline = false
-
-  vim.wo[aside_win].statuscolumn =
-    "%!v:lua.require('aside.display.aside').statuscolumn_for_buf("
-    .. aside_buf
-    .. ")"
-
-  if vim.api.nvim_win_is_valid(current_win) then
-    vim.api.nvim_set_current_win(current_win)
-  end
-
-  local augroup_name = "Aside_" .. source_win .. "_" .. aside_buf
-
-  aside_windows[source_win] = {
-    win = aside_win,
-    buf = aside_buf,
+  local W = {
+    source_win = source_win,
     family = family_name,
     source_path = source_path,
-    layout = nil,
+    panels = {},
     in_insert = false,
     deferred_render = false,
-    modified = false,
-    augroup_name = augroup_name,
+    modified = false, -- forced "dirty" flag; the buffer's 'modified' also counts
   }
-
-  local group = vim.api.nvim_create_augroup(augroup_name, { clear = true })
-
-  vim.api.nvim_create_autocmd("BufWriteCmd", {
-    group = group,
-    buffer = aside_buf,
-    callback = function()
-      local aside_data = aside_windows[source_win]
-      if not aside_data then
-        return
-      end
-      local save = require("aside.display.aside_save")
-      local layout = aside_data.layout
-          or { rows = {}, virt_lines_by_source_line = {} }
-      save.handle_save(
-        aside_data.buf,
-        aside_data.source_path,
-        aside_data.family,
-        layout
-      )
-      aside_data.modified = false
-      vim.schedule(function()
-        if aside_windows[source_win] then
-          M.render(source_win)
-        end
-      end)
-    end,
-  })
-
-  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
-    group = group,
-    buffer = aside_buf,
-    callback = function()
-      local aside_data = aside_windows[source_win]
-      if aside_data then
-        aside_data.modified = true
-      end
-    end,
-  })
-
-  vim.api.nvim_create_autocmd("InsertEnter", {
-    group = group,
-    buffer = aside_buf,
-    callback = function()
-      local aside_data = aside_windows[source_win]
-      if aside_data then
-        aside_data.in_insert = true
-      end
-    end,
-  })
-  vim.api.nvim_create_autocmd("InsertLeave", {
-    group = group,
-    buffer = aside_buf,
-    callback = function()
-      local aside_data = aside_windows[source_win]
-      if not aside_data then
-        return
-      end
-      aside_data.in_insert = false
-      if aside_data.pending_family then
-        if aside_data.modified then
-          vim.notify(
-            "aside: unsaved changes; :w or :e! before switching family",
-            vim.log.levels.ERROR
-          )
-          return
-        end
-        local pending = aside_data.pending_family
-        aside_data.pending_family = nil
-        aside_data.deferred_render = false
-        M.set_family(source_win, pending)
-        return
-      end
-      if aside_data.deferred_render then
-        aside_data.deferred_render = false
-        vim.schedule(function()
-          if aside_windows[source_win] then
-            M.render(source_win)
-          end
-        end)
-      end
-    end,
-  })
-
-  vim.api.nvim_create_autocmd("WinScrolled", {
-    group = group,
-    callback = function(args)
-      if not vim.api.nvim_win_is_valid(source_win) then
-        return
-      end
-      local aside_data = aside_windows[source_win]
-      if not aside_data or not vim.api.nvim_win_is_valid(aside_data.win) then
-        return
-      end
-      -- WinScrolled fires once with vim.v.event populated by a dict of
-      -- {[winid_string] = {...}} for every window that scrolled. args.match
-      -- holds the most recently scrolled winid (as a string). Only react
-      -- when source_win or aside_win participated.
-      local matched = tonumber(args.match)
-      local scrolled_win
-      if matched == source_win or matched == aside_data.win then
-        scrolled_win = matched
-      else
-        local ev = vim.v.event or {}
-        if ev[tostring(source_win)] then
-          scrolled_win = source_win
-        elseif ev[tostring(aside_data.win)] then
-          scrolled_win = aside_data.win
-        end
-      end
-      if scrolled_win and M.sync_scroll then
-        M.sync_scroll(source_win, scrolled_win)
-      end
-    end,
-  })
-
-  vim.api.nvim_create_autocmd("BufEnter", {
-    group = group,
-    callback = function()
-      if not vim.api.nvim_win_is_valid(source_win) then
-        return
-      end
-      if vim.api.nvim_get_current_win() == source_win then
-        if M.handle_source_change then
-          vim.schedule(function()
-            M.handle_source_change(source_win)
-          end)
-        end
-      end
-    end,
-  })
-
-  vim.api.nvim_create_autocmd("BufWritePost", {
-    group = group,
-    callback = function()
-      if not vim.api.nvim_win_is_valid(source_win) then
-        return
-      end
-      if vim.api.nvim_get_current_win() == source_win then
-        if M.handle_source_change then
-          vim.schedule(function()
-            M.handle_source_change(source_win)
-          end)
-        end
-      end
-    end,
-  })
-
+  windows[source_win] = W
+  W.buf = get_panel(W, source_path)
+  W.layout = pstate[W.buf] and pstate[W.buf].layout
+  local width = family_config(family_name).aside_width or config.get_value("aside_width", 40)
+  W.win = vim.api.nvim_open_win(W.buf, false, { split = "right", win = source_win, width = width })
+  setup_aside_win(W.win)
+  W.widths = vim.api.nvim_win_get_width(W.win) .. ":" .. vim.api.nvim_win_get_width(source_win)
   M.render(source_win)
-  -- Initial scroll sync: if the source was already scrolled when open_aside
-  -- was invoked, the aside opens at topline=1 and won't catch up until the
-  -- user triggers another scroll. Force a one-shot sync so the panel lines
-  -- up with the visible source region immediately.
-  M.sync_scroll(source_win, source_win)
 end
 
 function M.close(win)
   win = resolve_source_win(win)
-  local aside_data = aside_windows[win]
-  if not aside_data then
+  local W = windows[win]
+  if not W then
     return
   end
-
-  -- Delete augroup to prevent leaks. nvim_del_augroup_by_name raises if the
-  -- group is already gone, so always pcall it.
-  if aside_data.augroup_name then
-    pcall(vim.api.nvim_del_augroup_by_name, aside_data.augroup_name)
+  windows[win] = nil
+  clear_padding(W)
+  if valid_win(W.win) then
+    pcall(vim.api.nvim_win_close, W.win, true)
   end
-
-  pcall(function()
-    require("aside.display.aside_extmarks").clear(aside_data.buf)
-  end)
-
-  -- Clear source-side virt_lines
-  local ok_buf, source_buf = pcall(vim.api.nvim_win_get_buf, win)
-  if ok_buf and source_buf and vim.api.nvim_buf_is_valid(source_buf) then
-    pcall(vim.api.nvim_buf_clear_namespace, source_buf, source_padding_ns, 0, -1)
+  for key, buf in pairs(W.panels or {}) do
+    if valid_buf(buf) and vim.bo[buf].modified then
+      orphans[key] = buf -- keep unsaved edits for the next open
+    else
+      wipe_panel(buf)
+    end
   end
-
-  if aside_data.win and vim.api.nvim_win_is_valid(aside_data.win) then
-    pcall(vim.api.nvim_win_close, aside_data.win, true)
-  end
-
-  if aside_data.buf and vim.api.nvim_buf_is_valid(aside_data.buf) then
-    pcall(vim.api.nvim_buf_delete, aside_data.buf, { force = true })
-  end
-
-  aside_windows[win] = nil
 end
 
+--- Follow the source window to a different file.
 function M.handle_source_change(source_win)
-  local aside_data = aside_windows[source_win]
-  if not aside_data then
+  local W = windows[source_win]
+  if not W or W.closing or not valid_win(source_win) then
     return
   end
-  if not vim.api.nvim_win_is_valid(source_win) then
+  local new_path = vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(source_win))
+  if new_path == W.source_path or vim.bo[vim.api.nvim_win_get_buf(source_win)].filetype == "aside" then
     return
   end
-
-  local source_buf = vim.api.nvim_win_get_buf(source_win)
-  local new_path = vim.api.nvim_buf_get_name(source_buf)
-
-  if new_path == aside_data.source_path then
-    return
-  end
-
-  if not new_path or new_path == "" then
+  if new_path == "" then
     vim.notify("aside: source buffer has no name, aside cleared", vim.log.levels.WARN)
-    aside_data.source_path = ""
-    if vim.api.nvim_buf_is_valid(aside_data.buf) then
-      vim.bo[aside_data.buf].modifiable = true
-      vim.api.nvim_buf_set_lines(aside_data.buf, 0, -1, false, {})
-      pcall(vim.api.nvim_buf_clear_namespace, aside_data.buf, hl_ns, 0, -1)
-      pcall(function()
-        require("aside.display.aside_extmarks").clear(aside_data.buf)
-      end)
-      vim.bo[aside_data.buf].modifiable = true
-    end
-    aside_data.layout = nil
-    return
   end
-
-  aside_data.source_path = new_path
-  local new_buf_name = "aside://" .. aside_data.family .. "/" .. new_path
-  pcall(vim.api.nvim_buf_set_name, aside_data.buf, new_buf_name)
-
+  clear_padding(W)
+  switch_panel(W, W.family, new_path)
   M.render(source_win)
 end
 
 function M.set_family(win, family_name)
   win = resolve_source_win(win)
-  local aside_data = aside_windows[win]
-  if not aside_data then
-    vim.notify(
-      "aside: no aside panel open for this window",
-      vim.log.levels.ERROR
-    )
+  local W = windows[win]
+  if not W then
+    vim.notify("aside: no aside panel open for this window", vim.log.levels.ERROR)
     return
   end
-  if aside_data.modified then
-    vim.notify(
-      "aside: unsaved changes; :w or :e! before switching family",
-      vim.log.levels.ERROR
-    )
+  if is_modified(W) then
+    vim.notify("aside: unsaved changes; :w or :e! before switching family", vim.log.levels.ERROR)
     return
   end
-  if aside_data.in_insert then
-    aside_data.pending_family = family_name
-    aside_data.deferred_render = true
+  if W.in_insert then
+    W.pending_family = family_name
+    W.deferred_render = true
     return
   end
-  if not state.family_exists(family_name) then
-    state.ensure_family(family_name)
+  state.ensure_family(family_name)
+  if family_name ~= W.family and W.panels then
+    switch_panel(W, family_name, W.source_path)
   end
-  aside_data.family = family_name
-
-  if aside_data.buf and vim.api.nvim_buf_is_valid(aside_data.buf) then
-    local new_name = "aside://" .. family_name .. "/" .. aside_data.source_path
-    pcall(vim.api.nvim_buf_set_name, aside_data.buf, new_name)
-  end
-
+  W.family = family_name
   M.render(win)
 end
 
--- Reentrancy guard: prevents WinScrolled from triggering an infinite loop
--- when sync_scroll programmatically scrolls a window (which fires WinScrolled
--- again). Module-level so it spans both window callbacks.
-local _syncing = false
-
---- Sync scroll position between a source window and its aside panel.
---- Uses nvim_win_text_height to compute visual row offsets so wrapped lines,
---- folds, and virt_lines stay aligned. Bidirectional: callers (typically the
---- WinScrolled autocmd) pass the winid that just scrolled. When omitted, the
---- source window is assumed to be the scroll origin.
----@param source_win integer
----@param scrolled_win? integer winid of the window that scrolled
+--- Sync scroll between a source window and its panel; `scrolled_win` is
+--- the window whose view should win (defaults to the source).
 function M.sync_scroll(source_win, scrolled_win)
-  if _syncing then
-    return
-  end
-  local aside_data = aside_windows[source_win]
-  if not aside_data then
-    return
-  end
-  if not vim.api.nvim_win_is_valid(source_win)
-    or not vim.api.nvim_win_is_valid(aside_data.win)
-  then
-    return
-  end
-
-  _syncing = true
-  pcall(function()
-    if scrolled_win == aside_data.win then
-      M._sync_aside_to_source(source_win, aside_data)
-    else
-      M._sync_source_to_aside(source_win, aside_data)
-    end
-  end)
-  _syncing = false
-end
-
---- Compute the aside-row offset corresponding to source buffer line `S`.
---- Defined as: (S - 1) + (sum of our own virt_lines below source lines < S).
----
---- This DELIBERATELY ignores `nvim_win_text_height` so that wrap rows in the
---- source pane AND virt_lines inserted by other plugins do not skew the sync.
---- The aside layout is indexed by source buffer line, not source visual row.
----@param aside_data table aside_windows[source_win] entry
----@param S integer 1-indexed source buffer line
----@return integer offset 0-indexed offset of source line S in the aside buffer
-local function aside_offset_for_source_line(aside_data, S)
-  if S <= 1 then return 0 end
-  local virt = aside_data.layout and aside_data.layout.virt_lines_by_source_line
-  if not virt then return S - 1 end
-  local offset = S - 1
-  for src_line, count in pairs(virt) do
-    if src_line < S and count and count > 0 then
-      offset = offset + count
-    end
-  end
-  return offset
-end
-
---- Sync the aside panel topline to match the source window's buffer-line
---- position. We use the source BUFFER offset plus our layout's virt_lines,
---- never the visual row count, so other plugins' virt_lines and source-side
---- wrap rows do not shift the aside.
----@param source_win integer
----@param aside_data table
-function M._sync_source_to_aside(source_win, aside_data)
-  local source_topline = vim.fn.line("w0", source_win)
-  if source_topline <= 1 then
-    M._set_topline(aside_data.win, 1)
-    return
-  end
-
-  local target_aside_row = aside_offset_for_source_line(aside_data, source_topline) + 1
-  local aside_line_count = vim.api.nvim_buf_line_count(aside_data.buf)
-  target_aside_row = math.max(1, math.min(target_aside_row, aside_line_count))
-
-  M._set_topline(aside_data.win, target_aside_row)
-end
-
---- Sync the source window's topline to match the aside panel's topline. The
---- inverse of `_sync_source_to_aside`: finds the largest source buffer line
---- `S` whose `aside_offset_for_source_line(S)` does not exceed `aside_topline-1`.
---- Picking the LARGEST such S (not smallest with offset >= target) keeps the
---- round-trip stable when our own virt_lines sit between source lines.
----@param source_win integer
----@param aside_data table
-function M._sync_aside_to_source(source_win, aside_data)
-  local aside_topline = vim.fn.line("w0", aside_data.win)
-  if aside_topline <= 1 then
-    M._set_topline(source_win, 1)
-    return
-  end
-
-  local target_offset = aside_topline - 1
-  local source_buf = vim.api.nvim_win_get_buf(source_win)
-  local source_line_count = vim.api.nvim_buf_line_count(source_buf)
-
-  -- Upper-mid bias: we want the LARGEST S satisfying the predicate, so round
-  -- up to avoid getting stuck on lo.
-  local lo, hi = 1, source_line_count
-  while lo < hi do
-    local mid = math.floor((lo + hi + 1) / 2)
-    if aside_offset_for_source_line(aside_data, mid) <= target_offset then
-      lo = mid
-    else
-      hi = mid - 1
-    end
-  end
-
-  M._set_topline(source_win, lo)
-end
-
--- Persist a topline change on `win`. Both nvim_win_call and win_execute
--- save+restore the cursor/view around the body they invoke, which silently
--- undoes a winrestview() call. A normal-mode `<n>Gzt` motion mutates the
--- cursor position itself, so the restored "view" coincides with the desired
--- topline. This is the only Neovim primitive that reliably persists a
--- programmatic scroll on a non-current window.
----@param win integer
----@param topline integer 1-indexed buffer row to make the window's top
-function M._set_topline(win, topline)
-  if not vim.api.nvim_win_is_valid(win) then
-    return
-  end
-  local buf = vim.api.nvim_win_get_buf(win)
-  local n = math.max(1, math.min(topline, vim.api.nvim_buf_line_count(buf)))
-  pcall(vim.fn.win_execute, win, "keepjumps normal! " .. n .. "Gzt", true)
-end
-
---- Apply source-side virt_lines padding for crowded annotations.
---- Clears the dedicated namespace first to prevent accumulation across renders.
----@param source_buf integer Source buffer handle
----@param virt_lines_by_source_line table<integer, integer> source_line -> count
-function M.apply_source_virt_lines(source_buf, virt_lines_by_source_line)
-  if not vim.api.nvim_buf_is_valid(source_buf) then
-    return
-  end
-
-  vim.api.nvim_buf_clear_namespace(source_buf, source_padding_ns, 0, -1)
-
-  for source_line, count in pairs(virt_lines_by_source_line) do
-    if count > 0 then
-      local virt_lines = {}
-      for _ = 1, count do
-        table.insert(virt_lines, { { "", "Conceal" } })
-      end
-      pcall(vim.api.nvim_buf_set_extmark, source_buf, source_padding_ns, source_line - 1, 0, {
-        virt_lines = virt_lines,
-        virt_lines_above = false,
-      })
-    end
+  local W = windows[source_win]
+  if W then
+    sync(W, scrolled_win == W.win and "aside" or "source")
   end
 end
 
---- Render the aside buffer for a source window using the layout solver.
---- Only handles aside-buffer text + highlight extmarks + edit-region extmarks.
---- Does NOT manage window lifecycle (Task 11), scroll sync (Task 13), or
---- source-side virt_lines insertion (Task 15).
----@param source_win integer
-function M.render(source_win)
-  local aside_data = aside_windows[source_win]
-  if not aside_data then
-    return
-  end
-
-  -- Resolve source buffer / path. Tests may pre-populate these in aside_data.
-  local source_buf = aside_data.source_buf
-  if not source_buf and vim.api.nvim_win_is_valid(source_win) then
-    source_buf = vim.api.nvim_win_get_buf(source_win)
-  end
-  if not source_buf or not vim.api.nvim_buf_is_valid(source_buf) then
-    return
-  end
-  local source_path = vim.api.nvim_buf_get_name(source_buf)
-  aside_data.source_path = source_path
-
-  -- Filter annotations for current family and source path.
-  local all_annotations = require("aside.annotations").get_by_file(source_path)
-  local family_annotations = {}
-  for _, ann in ipairs(all_annotations) do
-    if ann.family == aside_data.family then
-      table.insert(family_annotations, ann)
-    end
-  end
-
-  -- Resolve family config (with global fallback).
-  local family = state.get_family(aside_data.family)
-  local family_config = family and family:get_config() or {}
-  local global = config.get() or {}
-
-  local gutter_icon = family_config.gutter_icon
-    or config.get_value("default_gutter_icon", "\226\151\143")
-  local spill_direction = family_config.spill_direction
-    or config.get_value("spill_direction", "below")
-  local solver_name = family_config.layout_solver
-    or config.get_value("layout_solver", "greedy")
-  local hl_groups = family_config.highlight_groups or global.highlight_groups or {}
-
-  -- Resolve wrap_width. Allow test override via aside_data.wrap_width.
-  local wrap_width
-  if aside_data.wrap_width then
-    wrap_width = aside_data.wrap_width
-  else
-    local ok, win_width = pcall(vim.api.nvim_win_get_width, aside_data.win)
-    if ok and type(win_width) == "number" then
-      -- 2 gutter cols + 1 safety col for cursor / wrap
-      wrap_width = math.max(1, win_width - 2 - 1)
-    else
-      wrap_width = 37
-    end
-  end
-
-  local source_line_count = vim.api.nvim_buf_line_count(source_buf)
-
-  -- Solve layout.
-  local layout = require("aside.layout").get(solver_name).solve(
-    family_annotations,
-    source_line_count,
-    {
-      spill_direction = spill_direction,
-      wrap_width = wrap_width,
-      gutter_icon = gutter_icon,
-    }
-  )
-
-  -- Apply source-side virt_lines for crowded annotations
-  if layout.virt_lines_by_source_line and next(layout.virt_lines_by_source_line) then
-    M.apply_source_virt_lines(source_buf, layout.virt_lines_by_source_line)
-  else
-    -- Clear any existing padding
-    if vim.api.nvim_buf_is_valid(source_buf) then
-      vim.api.nvim_buf_clear_namespace(source_buf, source_padding_ns, 0, -1)
-    end
-  end
-
-  -- Build buffer text from rows.
-  local lines = {}
-  for i, row in ipairs(layout.rows) do
-    lines[i] = row.text or ""
-  end
-
-  -- Write buffer.
-  local aside_buf = aside_data.buf
-  if not vim.api.nvim_buf_is_valid(aside_buf) then
-    return
-  end
-  vim.bo[aside_buf].modifiable = true
-  vim.api.nvim_buf_set_lines(aside_buf, 0, -1, false, lines)
-
-  -- Reset highlight namespace before re-applying.
-  vim.api.nvim_buf_clear_namespace(aside_buf, hl_ns, 0, -1)
-
-  local gutter_prefix_bytes = #gutter_icon + 1 -- gutter_icon + " "
-
-  for i, row in ipairs(layout.rows) do
-    local line_idx = i - 1
-    local line_bytes = #lines[i]
-    if row.row_kind == "title" then
-      -- Highlight the gutter prefix (icon + space) and the title separately.
-      if gutter_prefix_bytes > 0 and gutter_prefix_bytes <= line_bytes then
-        pcall(vim.api.nvim_buf_set_extmark, aside_buf, hl_ns, line_idx, 0, {
-          end_col = math.min(gutter_prefix_bytes, line_bytes),
-          hl_group = hl_groups.gutter or "AsideGutter",
-        })
-      end
-      if line_bytes > gutter_prefix_bytes then
-        pcall(vim.api.nvim_buf_set_extmark, aside_buf, hl_ns, line_idx, gutter_prefix_bytes, {
-          end_col = line_bytes,
-          hl_group = hl_groups.title or "AsideTitle",
-        })
-      end
-    elseif row.row_kind == "content" then
-      if line_bytes > 0 then
-        pcall(vim.api.nvim_buf_set_extmark, aside_buf, hl_ns, line_idx, 0, {
-          end_col = line_bytes,
-          hl_group = hl_groups.contents or "AsideContents",
-        })
-      end
-    elseif row.row_kind == "closer" then
-      if line_bytes > 0 then
-        pcall(vim.api.nvim_buf_set_extmark, aside_buf, hl_ns, line_idx, 0, {
-          end_col = line_bytes,
-          hl_group = hl_groups.border or "AsideBorder",
-        })
-      end
-    end
-  end
-
-  -- Place edit-region extmarks (seg_start / wrap_cont / ann_end).
-  require("aside.display.aside_extmarks").place(aside_buf, layout)
-
-  -- Persist layout for statuscolumn callback and scroll sync.
-  aside_data.layout = layout
-
-  -- Buffer stays editable (no modifiable = false here).
-  vim.bo[aside_buf].modifiable = true
-
-  -- nvim_buf_set_lines marks the buffer 'modified' and fires TextChanged on
-  -- the next event tick, both flagging this programmatic render as a user
-  -- edit. Clear Vim's flag immediately and clear our own flag on the next
-  -- tick (after TextChanged has run) so :close / set_family don't refuse.
-  vim.bo[aside_buf].modified = false
-  aside_data.modified = false
-  vim.schedule(function()
-    if aside_windows[source_win] and vim.api.nvim_buf_is_valid(aside_buf) then
-      vim.bo[aside_buf].modified = false
-      aside_data.modified = false
-    end
-  end)
-end
-
---- Statuscolumn callback for the aside buffer.
---- Called per-row with `vim.v.lnum` set (1-indexed). Returns the 2-column
---- glyph string. The OUTER (left, far from text) column tracks the source
---- ANCHOR span; the INNER (right, adjacent to text) column tracks the full
---- ANNOTATION box. The `lnum` parameter is a test seam — when omitted the
---- live `vim.v.lnum` is used (the only path Neovim itself invokes).
----@param buf integer Aside buffer handle
----@param lnum? integer 1-indexed row number; defaults to vim.v.lnum
----@return string statuscolumn content
+--- Gutter glyphs of an aside row as a statusline string: outer column =
+--- source anchor bracket, inner column = annotation box. (The window draws
+--- the same glyphs as signs.)
+---@param buf integer
+---@param lnum? integer 1-indexed row (defaults to v:lnum)
 function M.statuscolumn_for_buf(buf, lnum)
-  local aside_data = nil
-  for _, data in pairs(aside_windows) do
-    if data.buf == buf then
-      aside_data = data
-      break
-    end
+  local W
+  for _, data in pairs(windows) do
+    if data.buf == buf then W = data break end
   end
-  if not aside_data or not aside_data.layout then
-    return "  "
-  end
-
   lnum = lnum or vim.v.lnum
-  local row = aside_data.layout.rows[lnum]
+  local row = W and ((W.rows and W.rows[lnum]) or (W.layout and W.layout.rows[lnum]))
   if not row then
     return "  "
   end
-
-  -- Outer (left) column: anchor position glyphs.
-  local outer_glyph = ({
-    top = "\226\148\144",        -- ┐
-    middle = "\226\148\130",     -- │
-    bottom = "\226\148\152",     -- ┘
-    single = "\226\148\130",     -- │
-    connector = "\226\148\156",  -- ├
-    none = " ",
-  })[row.anchor_position] or " "
-
-  -- Inner (right) column: annotation-box position glyphs.
-  local inner_glyph = ({
-    top = "\226\148\140",        -- ┌
-    middle = "\226\148\130",     -- │
-    bottom = "\226\148\148",     -- └
-    single = "\226\148\128",     -- ─
-    connector = "\226\148\164",  -- ┤
-    none = " ",
-  })[row.box_position] or " "
-
-  return "%#AsideBorder#" .. outer_glyph .. inner_glyph
+  return "%#AsideBorder#" .. (ANCHOR_GLYPH[row.anchor_position] or " ") .. (BOX_GLYPH[row.box_position] or " ")
 end
 
+--- Re-render every panel showing `buf`'s file (deferred while edited).
 function M.refresh_if_visible(buf)
   local path = vim.api.nvim_buf_get_name(buf)
-  for source_win, aside_data in pairs(aside_windows) do
-    if aside_data.source_path == path then
-      if aside_data.in_insert then
-        aside_data.deferred_render = true
-        return
-      else
-        M.render(source_win)
-      end
+  for source_win, W in pairs(windows) do
+    if W.source_path == path then
+      M.render(source_win)
     end
+  end
+end
+
+--- Map a row of an aside buffer to its source file and line.
+---@return string? path, integer? line
+function M.map_to_source(buf, lnum)
+  local _, W = owner_of(buf)
+  local row = W and W.rows and W.rows[lnum]
+  if W then
+    return W.source_path, row and row.source_line or lnum
   end
 end
 
 function M.get_aside_data(source_win)
-  return aside_windows[resolve_source_win(source_win)]
+  return windows[resolve_source_win(source_win)]
 end
 
 return M

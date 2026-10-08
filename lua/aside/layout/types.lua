@@ -8,13 +8,15 @@
 ---@field row_kind "empty"|"title"|"content"|"spill"|"closer" type of row
 ---@field segment_idx number? logical segment index within annotation (0=title, 1+=content lines)
 ---@field text string buffer text for this row (empty string for empty/spill rows)
+---@field sep string? whitespace dropped at a wrap point; non-nil marks a wrap continuation row
 ---@field is_anchor boolean true if source_line is one of the annotation's real anchor lines
----@field box_position "top"|"middle"|"bottom"|"single"|"connector"|"none" annotation-box statuscolumn glyph (inner column, adjacent to text)
----@field anchor_position "top"|"middle"|"bottom"|"single"|"connector"|"none" source-anchor statuscolumn glyph (outer column, far from text)
+---@field box_position "top"|"middle"|"bottom"|"single"|"connector"|"none" annotation-box gutter glyph (inner column, adjacent to text)
+---@field anchor_position "top"|"middle"|"bottom"|"single"|"connector"|"none" source-anchor gutter glyph (outer column, far from text)
 
 ---@class Aside.Layout.Result
 ---@field rows Aside.Layout.Row[] one entry per aside buffer line
----@field virt_lines_by_source_line table<number, number> map source line number → count of virt_lines to insert BELOW it
+---@field virt_lines_by_source_line table<number, number> map source line number → count of extra rows in its block
+---@field annotations {id: string, start_line: number, end_line: number}[] placed annotations (lines clamped to the file)
 
 ---@class Aside.Layout.SolverOptions
 ---@field spill_direction "above"|"below" default "below"

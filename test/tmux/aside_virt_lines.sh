@@ -32,7 +32,7 @@ aside_lua "$SESSION" 'require("aside").open_aside({family="test_comments",win=0}
 sleep 0.8
 
 # Count extmarks in the aside_source_padding namespace on the source buffer.
-aside_lua "$SESSION" "vim.schedule(function() local ns=vim.api.nvim_create_namespace('aside_source_padding'); local marks=vim.api.nvim_buf_get_extmarks(0, ns, 0, -1, {}); local f=io.open('${OUT}','w'); f:write('PAD_MARKS='..#marks..'\\n'); f:close() end)"
+aside_lua "$SESSION" "vim.schedule(function() local marks={}; for name,ns in pairs(vim.api.nvim_get_namespaces()) do if name:find('^aside_source_padding') then vim.list_extend(marks, vim.api.nvim_buf_get_extmarks(0, ns, 0, -1, {})) end end; local f=io.open('${OUT}','w'); f:write('PAD_MARKS='..#marks..'\\n'); f:close() end)"
 sleep 0.5
 
 GOLDEN="test/tmux/snapshots/${SCENARIO}.txt"

@@ -10,16 +10,36 @@ aside.nvim is a Lua library for Neovim that tracks and displays code annotations
 
 ### Running Tests
 
+Test dependencies (neovim, tmux, mini.nvim) come from the nix flake. The
+flake's dev shell exports `MINI_PATH`, which `test/init_minimal.lua` adds to
+the runtimepath. On this machine `LD_LIBRARY_PATH` must be unset or the
+shell's bash crashes ("stack smashing detected").
+
 ```bash
-# Run all tests using mini.test (requires mini.nvim installed)
-nvim --headless -u test/init_minimal.lua -c "lua require('mini.test').run_file('test/aside_spec.lua')"
+# Core suite
+env -u LD_LIBRARY_PATH nix develop -c nvim --headless -u test/init_minimal.lua \
+  -c "lua require('mini.test').run_file('test/aside_spec.lua')"
 
-# Run a single test set (e.g., "setup()" tests)
-nvim --headless -u test/init_minimal.lua -c "lua require('mini.test').run_file('test/aside_spec.lua', { filter = 'setup' })"
+# Aside panel suite (scroll alignment, save/edit round-trips, live realign)
+env -u LD_LIBRARY_PATH nix develop -c nvim --headless -u test/init_minimal.lua \
+  -c "lua require('mini.test').run_file('test/aside_panel_spec.lua')"
 
-# Run a specific test by pattern
-nvim --headless -u test/init_minimal.lua -c "lua require('mini.test').run_file('test/aside_spec.lua', { filter = 'add_annotation' })"
+# Filter to matching test cases (desc = { file, set, case })
+env -u LD_LIBRARY_PATH nix develop -c nvim --headless -u test/init_minimal.lua \
+  -c "lua require('mini.test').run_file('test/aside_panel_spec.lua', { collect = { filter_cases = function(c) return c.desc[3]:find('scrolloff') ~= nil end } })"
 ```
+
+Without nix: install mini.nvim anywhere and point `MINI_PATH` at it.
+
+Each mini.test child starts in a fresh temp cwd (see `test/init_minimal.lua`),
+so persisted `.aside/` data never leaks between runs.
+
+Headless-vs-TUI caveats for `test/aside_panel_spec.lua`:
+- `vim.wait()` inside an RPC call never reaches the main loop's normal_check,
+  so `WinScrolled` does not fire. Settle by idling the child from the parent
+  (`vim.uv.sleep` in the test process), as the spec's `settle()` does.
+- Headless `<C-e>` skips virt_line filler rows that the TUI shows
+  (`topfill`). Set such views explicitly with `winrestview`.
 
 ### Manual Testing
 
