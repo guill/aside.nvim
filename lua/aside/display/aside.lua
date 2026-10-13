@@ -92,11 +92,23 @@ local function pad_ns(W)
   return W.pad_ns
 end
 
+--- Tell the opener which padding rows the source window got, so it can
+--- mirror them into windows that must stay row-aligned with the source.
+local function notify_padding(W)
+  if W.on_padding then
+    local ok, err = pcall(W.on_padding, vim.deepcopy(W.pad), W.pad_buf)
+    if not ok then
+      vim.notify("aside: on_padding failed: " .. tostring(err), vim.log.levels.ERROR)
+    end
+  end
+end
+
 local function clear_padding(W)
   if valid_buf(W.pad_buf) then
     pcall(vim.api.nvim_buf_clear_namespace, W.pad_buf, pad_ns(W), 0, -1)
   end
   W.pad, W.pad_buf = {}, nil
+  notify_padding(W)
 end
 
 -- ---------------------------------------------------------------------------
@@ -230,6 +242,11 @@ local function sync(W, origin)
         dir = -1
       end
       set_view(W.source_win, source_view_for(W, g, k, dir))
+      -- 'scrollbind' only propagates from the current window; carry the
+      -- scroll on to the source's partners (e.g. the other side of a diff).
+      if vim.wo[W.source_win].scrollbind then
+        vim.api.nvim_win_call(W.source_win, function() vim.cmd("silent! syncbind") end)
+      end
     end
   end
   local g, k = source_pos(W)
@@ -314,6 +331,17 @@ local function apply_folds(W, folds)
   end)
 end
 
+--- A winbar takes the first screen row, so the panel needs one exactly when
+--- the source has one, or every row is off by one. A winbar the opener put
+--- on the panel is kept.
+local function match_winbar(W)
+  local want = vim.wo[W.source_win].winbar ~= ""
+  local has = vim.wo[W.win].winbar ~= ""
+  if want ~= has then
+    vim.api.nvim_set_option_value("winbar", want and " " or "", { win = W.win, scope = "local" })
+  end
+end
+
 --- Recompute padding on both sides from the live aside rows and the source
 --- measurements, then re-sync the views. Never rewrites aside text.
 local function realign(W, remeasure)
@@ -324,6 +352,7 @@ local function realign(W, remeasure)
   if vim.api.nvim_win_get_buf(W.win) ~= buf then
     return
   end
+  match_winbar(W)
   local source_buf = vim.api.nvim_win_get_buf(src)
   if remeasure or not W.measure or W.measure.buf ~= source_buf then
     W.measure = measure(W, source_buf)
@@ -407,6 +436,7 @@ local function realign(W, remeasure)
     pcall(vim.api.nvim_buf_set_extmark, source_buf, ns, line - 1, 0, { virt_lines = lines })
   end
   W.pad, W.pad_buf = pads, source_buf
+  notify_padding(W)
 
   -- Aside virt_lines: closers and filler, drawn over the gutter.
   vim.api.nvim_buf_clear_namespace(buf, virt_ns, 0, -1)
@@ -794,7 +824,8 @@ function M.setup()
   })
 end
 
----@param opts {family: string, win?: integer, buf?: integer}
+---@param opts {family: string, win?: integer, buf?: integer, on_padding?: fun(pads: table<integer, integer>, source_buf: integer?)}
+---@return integer? win
 function M.open(opts)
   opts = opts or {}
   local family_name = opts.family
@@ -804,7 +835,9 @@ function M.open(opts)
   end
   local source_win = resolve_source_win(opts.buf and 0 or opts.win)
   if windows[source_win] then
-    return M.set_family(source_win, family_name)
+    windows[source_win].on_padding = opts.on_padding or windows[source_win].on_padding
+    M.set_family(source_win, family_name)
+    return windows[source_win] and windows[source_win].win
   end
 
   local source_buf = vim.api.nvim_win_get_buf(source_win)
@@ -823,6 +856,7 @@ function M.open(opts)
     in_insert = false,
     deferred_render = false,
     modified = false, -- forced "dirty" flag; the buffer's 'modified' also counts
+    on_padding = opts.on_padding,
   }
   windows[source_win] = W
   W.buf = get_panel(W, source_path)
@@ -832,6 +866,7 @@ function M.open(opts)
   setup_aside_win(W.win)
   W.widths = vim.api.nvim_win_get_width(W.win) .. ":" .. vim.api.nvim_win_get_width(source_win)
   M.render(source_win)
+  return W.win
 end
 
 function M.close(win)
@@ -869,6 +904,18 @@ function M.handle_source_change(source_win)
   end
   clear_padding(W)
   switch_panel(W, W.family, new_path)
+  M.render(source_win)
+end
+
+function M.refresh(win)
+  local source_win = resolve_source_win(win)
+  local W = windows[source_win]
+  if not W or not valid_win(source_win) then
+    return
+  end
+  if vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(source_win)) ~= W.source_path then
+    return M.handle_source_change(source_win)
+  end
   M.render(source_win)
 end
 

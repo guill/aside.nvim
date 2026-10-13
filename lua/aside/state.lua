@@ -47,6 +47,11 @@ function FamilyMethods:configure(opts)
     return
   end
 
+  if opts.ephemeral ~= nil and type(opts.ephemeral) ~= "boolean" then
+    vim.notify("aside: ephemeral must be a boolean", vim.log.levels.ERROR)
+    return
+  end
+
   if opts.gutter_icon ~= nil then
     local width = vim.fn.strdisplaywidth(opts.gutter_icon)
     if width ~= 1 then

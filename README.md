@@ -157,6 +157,9 @@ family:configure({
   -- Must be display-width 1 (single terminal column)
   gutter_icon = "!",
   context_lines = 5,
+  -- Keep this family in memory only (never written to .aside/), e.g. when
+  -- it mirrors data owned by another plugin
+  ephemeral = true,
 })
 
 -- Get current configuration
@@ -267,6 +270,16 @@ aside.open_aside({
   win = 0,  -- Window ID (0 for current)
 })
 ```
+
+Returns the panel window (or `nil` on failure). Pass `on_padding = function(pads, source_buf) ... end` to be told which blank rows the panel inserted into the source window (`pads[line] = count`, rows below `line`; an empty table when cleared). Mirror them into windows that must stay row-aligned with the source, such as the other side of a `diff` split. When the source window has `'scrollbind'`, scrolling the panel also scrolls its bound partners.
+
+#### `aside.is_setup() -> boolean`
+
+Whether `setup()` has run. Plugins that use aside.nvim as an optional dependency can call `setup()` themselves when it has not.
+
+#### `aside.refresh_aside(win?)`
+
+Re-render a window's panel, following its source buffer if it was swapped or renamed in place (no `BufEnter`/`BufWinEnter` fired).
 
 #### `aside.close_aside(win?)`
 

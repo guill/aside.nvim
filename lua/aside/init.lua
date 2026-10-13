@@ -11,6 +11,8 @@ local annotations = require("aside.annotations")
 local persistence = require("aside.persistence")
 local display = require("aside.display")
 
+local did_setup = false
+
 ---@class Aside.SetupOpts
 ---@field context_lines? number Lines of context stored around annotated text (default: 3)
 ---@field persistence_debounce_ms? number Debounce time for persistence writes (default: 1000)
@@ -52,6 +54,13 @@ function M.setup(opts)
   state.initialize()
   persistence.setup()
   display.setup()
+  did_setup = true
+end
+
+--- Whether `setup()` has run (for plugins that drive aside optionally)
+---@return boolean
+function M.is_setup()
+  return did_setup
 end
 
 -- ============================================================================
@@ -71,6 +80,7 @@ end
 ---@field spill_direction? "above"|"below" Direction to spill overflow annotation rows (default: "below")
 ---@field layout_solver? string Name of the layout solver to use (default: "greedy")
 ---@field highlight_groups? table<string, string> Highlight group overrides
+---@field ephemeral? boolean Keep the family in memory only; never written to disk (for externally owned data)
 
 --- Create or get an existing family
 ---@param name string Family name
@@ -190,11 +200,20 @@ end
 ---@field family string Family name
 ---@field win? number Window ID (0 for current)
 ---@field buf? number Buffer ID (0 for current, uses its window)
+---@field on_padding? fun(pads: table<integer, integer>, source_buf: integer?) Called whenever the panel's padding in the source window changes: `pads[line] = n` blank rows below source `line` (empty table when cleared). Use it to mirror the rows into windows kept row-aligned with the source (e.g. the other side of a diff).
 
 --- Open the aside panel for a window
 ---@param opts Aside.OpenAsideOpts
+---@return integer? win The panel window, or nil on failure
 function M.open_aside(opts)
-  display.open_aside(opts)
+  return display.open_aside(opts)
+end
+
+--- Re-render a window's aside panel, following its source buffer when the
+--- buffer was swapped or renamed without a BufEnter/BufWinEnter.
+---@param win? number Source or panel window ID (0 for current)
+function M.refresh_aside(win)
+  require("aside.display.aside").refresh(win)
 end
 
 --- Close the aside panel for a window

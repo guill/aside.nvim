@@ -467,6 +467,34 @@ T["source"]["switching the source file clears padding from the previous buffer"]
   eq(child.lua_get("vim.api.nvim_win_is_valid(H.win)"), true)
 end
 
+T["source"]["a winbar on the source window keeps rows aligned"] = function()
+  child.lua([[
+    H.make_file(); H.add(10, 10, "Title", "body")
+    vim.api.nvim_set_option_value("winbar", "source bar", { win = H.src, scope = "local" })
+    H.open()
+  ]])
+  settle()
+  eq(misaligned(), {})
+  eq(child.lua_get("vim.go.winbar"), "")
+  child.lua([[vim.api.nvim_set_option_value("winbar", "", { win = H.src, scope = "local" }); require("aside").refresh_aside(H.src)]])
+  settle()
+  eq(misaligned(), {})
+end
+
+T["source"]["refresh_aside follows a source buffer renamed in place"] = function()
+  child.lua([[
+    H.make_file(); H.add(10, 10, "Old", ""); H.open()
+    _G.new_path = vim.fn.tempname() .. ".lua"
+    require("aside").add_annotation({ family = "f", file = _G.new_path, start_line = 5, title = "New" })
+    vim.api.nvim_buf_set_name(H.src_buf, _G.new_path)
+    require("aside").refresh_aside(H.src)
+  ]])
+  settle()
+  child.lua("H.buf = H.d.buf")
+  eq(child.lua_get("H.aside_lnum('Old')"), vim.NIL)
+  eq(child.lua_get("H.aside_lnum('New')"), 5)
+end
+
 T["source"]["closing the aside window with :q clears source padding"] = function()
   child.lua([[H.make_file(); H.add(10, 12, "Range", "body"); H.open()]])
   child.type_keys("<C-w>l", ":q<CR>")
@@ -698,6 +726,58 @@ end
 -- ============================================================================
 -- Panel lifecycle
 -- ============================================================================
+
+T["diff partner"] = MiniTest.new_set()
+
+-- Source window in 'diff' + 'scrollbind' with a partner on the left that is
+-- missing lines 50-55 of the source, like the old side of a diff.
+local function open_with_diff_partner()
+  child.lua([[
+    H.make_file()
+    local lines = vim.api.nvim_buf_get_lines(H.src_buf, 0, -1, false)
+    for _ = 50, 55 do table.remove(lines, 50) end
+    _G.lbuf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(_G.lbuf, 0, -1, false, lines)
+    _G.lwin = vim.api.nvim_open_win(_G.lbuf, false, { split = "left", win = H.src })
+    for _, w in ipairs({ _G.lwin, H.src }) do
+      vim.wo[w][0].diff, vim.wo[w][0].scrollbind, vim.wo[w][0].foldenable = true, true, false
+    end
+    H.add(30, 30, "Tall", "a\nb\nc\nd\ne")
+    _G.pads = nil
+    _G.opened = require("aside").open_aside({ family = "f", win = H.src, on_padding = function(p) _G.pads = p end })
+    H.d = require("aside.display.aside").get_aside_data(H.src)
+    H.win, H.buf = H.d.win, H.d.buf
+  ]])
+  settle()
+end
+
+T["diff partner"]["panel window does not join the diff or scrollbind"] = function()
+  open_with_diff_partner()
+  eq(child.lua_get("{ vim.wo[H.win].diff, vim.wo[H.win].scrollbind }"), { false, false })
+  eq(child.lua_get("_G.opened == H.win"), true)
+end
+
+T["diff partner"]["on_padding reports the source padding rows"] = function()
+  open_with_diff_partner()
+  eq(child.lua_get("_G.pads"), child.lua_get("H.d.pad"))
+  eq(child.lua_get("vim.tbl_count(_G.pads) > 0"), true)
+  child.lua("require('aside').close_aside(H.src)")
+  settle()
+  eq(child.lua_get("_G.pads"), {})
+end
+
+T["diff partner"]["scrolling the panel carries the scrollbind partner along"] = function()
+  open_with_diff_partner()
+  child.type_keys("<C-w>l", "100Gzt")
+  settle()
+  eq(child.lua_get("H.view(H.src).topline") > 90, true)
+  local partner_top = child.lua_get("H.view(_G.lwin).topline")
+  eq(partner_top > 80, true)
+  -- Neovim's own scrollbind from the source must not move the partner further.
+  child.lua("vim.api.nvim_win_call(H.src, function() vim.cmd('syncbind') end)")
+  eq(child.lua_get("H.view(_G.lwin).topline"), partner_top)
+  eq(misaligned(), {})
+end
 
 T["lifecycle"] = MiniTest.new_set()
 

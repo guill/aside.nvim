@@ -795,6 +795,20 @@ T["persistence"]["save and load roundtrip preserves all fields"] = function()
   eq(child.lua_get("_G.loaded.metadata.nested.a"), 1)
 end
 
+T["persistence"]["ephemeral family is never written to disk"] = function()
+  child.lua([[
+    _G.dir = vim.fn.tempname()
+    require("aside").setup({ data_dir = _G.dir })
+    require("aside").ensure_family("ram"):configure({ ephemeral = true })
+    require("aside").add_annotation({ family = "ram", file = "/tmp/test.lua", start_line = 1, title = "x" })
+    require("aside").add_annotation({ family = "disk", file = "/tmp/test.lua", start_line = 1, title = "y" })
+    require("aside.persistence").save_all()
+  ]])
+  eq(child.lua_get("vim.fn.filereadable(_G.dir .. '/ram.json')"), 0)
+  eq(child.lua_get("vim.fn.filereadable(_G.dir .. '/disk.json')"), 1)
+  eq(child.lua_get("#require('aside').get_annotations_by_family('ram')"), 1)
+end
+
 T["persistence"]["load returns false for nonexistent file"] = function()
   local result = child.lua_get("require('aside.persistence').load_family('nonexistent_family_xyz')")
   eq(result, false)

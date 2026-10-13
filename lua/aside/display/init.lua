@@ -112,7 +112,7 @@ function M.refresh_family(family_name)
 end
 
 function M.open_aside(opts)
-  aside_panel.open(opts)
+  return aside_panel.open(opts)
 end
 
 function M.close_aside(win)

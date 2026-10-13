@@ -24,6 +24,9 @@ function M.save_family(family_name)
   if not family then
     return false
   end
+  if family.config.ephemeral then
+    return true -- RAM only: the data is owned elsewhere
+  end
   ensure_data_dir()
   local annotations = {}
   for id, _ in pairs(family.annotations) do
